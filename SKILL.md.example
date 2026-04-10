@@ -7,6 +7,12 @@ description: Use when executing commands, training, or checking GPU status on re
 
 Execute commands on remote machines through a shared mount. All machines must mount the same data volume.
 
+## Prerequisites
+
+- `REMA_DIR` environment variable must be set (via `~/.rema_config`, which is created by `install.sh`)
+- To activate: `source ~/.rema_config` or `source ~/.bashrc` (if added during install)
+- Remote machine must have a worker running (`rema start <name>`)
+
 ## Quick Reference
 
 | Command | Description |
@@ -14,18 +20,30 @@ Execute commands on remote machines through a shared mount. All machines must mo
 | `rema start <name>` | Start worker in current directory |
 | `rema stop <name>` | Stop worker |
 | `rema status <name>` | idle / busy / off |
-| `rema run <name> -- <cmd>` | Sync: real-time output, wait for completion |
-| `rema run <name> --async -- <cmd>` | Async: submit and return immediately |
+| `rema run <name> [--async] -- <cmd>` | Execute command (sync: real-time; async: immediate return) |
 | `rema log <name>` | Show latest job output |
 | `rema log <name> <job_id>` | Show specific job output |
 | `rema list` | Show all machines and status |
 | `rema rm <name>` | Remove a machine (must be off) |
+
+## Installation
+
+```bash
+git clone https://github.com/Disapole-Xiao/ReMA.git
+cd ReMA
+cd /your/shared/workspace   # .rema/ will be created here
+bash install.sh
+source ~/.bashrc
+```
+
+To uninstall: `bash uninstall.sh`
 
 ## Usage
 
 Before running commands, the remote machine must have a worker running:
 ```bash
 # On remote machine, in the desired working directory:
+cd /your/project
 rema start <name>
 ```
 
@@ -34,16 +52,35 @@ Then from any machine:
 # Check status
 rema status <name>
 
-# Run command (sync, real-time output)
+# Run command (sync, real-time output, same exit code as command)
 rema run <name> -- nvidia-smi
 rema run <name> -- "cd project && python train.py"
 
-# Run command (async, returns immediately)
+# Run command (async, returns immediately, retrieve with log)
 rema run <name> --async -- "sleep 10 && python train.py"
 
-# Check output of async job
+# Check output of async job (latest or by ID)
 rema log <name>
+rema log <name> <job_id>
+
+# List all machines
+rema list
+
+# Remove a machine (must be off — stop first if idle/busy)
+rema stop <name>
+rema rm <name>
 ```
+
+## Configuration
+
+Set via `~/.rema_config` or environment variable. Priority: env var > `~/.rema_config` > default.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REMA_DIR` | required | Shared directory path (auto-set by `install.sh`) |
+| `REMA_LOG_KEEP_DAYS` | `7` | Auto-delete old logs (days) |
+
+To change log retention: `echo 'export REMA_LOG_KEEP_DAYS=30' >> ~/.rema_config && source ~/.rema_config`
 
 ## Key Behaviors
 
@@ -52,12 +89,4 @@ rema log <name>
 - `rema list` shows all registered machines; `off` means worker is not running or heartbeat expired
 - Each job gets a unique ID; use `rema log <name> <job_id>` for specific jobs
 - To remove a machine, it must be `off` — run `rema stop` first if idle/busy
-
-## Environment
-
-Set via `~/.rema_config` or environment variable:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `REMA_DIR` | required | Shared directory path |
-| `REMA_LOG_KEEP_DAYS` | `7` | Auto-delete old logs |
+- Multiple workers can run on the same machine under different names
