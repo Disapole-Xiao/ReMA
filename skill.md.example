@@ -18,6 +18,7 @@ Execute commands across machines through a shared mount. All machines must mount
 | `rema run <name> --async -- <cmd>` | Async: submit and return immediately |
 | `rema log <name>` | Show latest job output |
 | `rema list` | Show all machines and status |
+| `rema rm <name>` | Remove a machine (must be off) |
 
 ## Usage
 

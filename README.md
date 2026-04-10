@@ -20,13 +20,17 @@ The installer will:
 1. Default `REMA_DIR` to `$(pwd)/.rema` — run from the directory you want as your shared workspace root
 2. Write the config to `~/.rema_config`
 3. Symlink `rema` to `~/.local/bin/rema`
+4. Offer to add `source ~/.rema_config` to your `~/.bashrc`
 
-After installation, activate:
+After installation, activate in current shell:
 ```bash
-source ~/.rema_config
+source ~/.rema_config && source ~/.bashrc
 ```
 
-Or add `source ~/.rema_config` to your `~/.bashrc`.
+Or just copy this one-liner to activate immediately:
+```bash
+echo 'source ~/.rema_config' >> ~/.bashrc && source ~/.bashrc
+```
 
 ## Uninstallation
 
@@ -67,6 +71,7 @@ rema stop gpu-b
 | `rema run <name> --async -- <cmd>` | Execute command (async, returns immediately) |
 | `rema log <name> [job_id]` | View job output |
 | `rema list` | List all machines and status |
+| `rema rm <name>` | Remove a machine and its data |
 
 ## How It Works
 
@@ -92,13 +97,23 @@ Set via environment variable or `~/.rema_config`:
 
 ## File Layout
 
+Shared mount (cross-machine communication):
 ```
 $REMA_DIR/
   <name>/
+    registered   # Machine registration marker
     cmd          # Pending command (key=value format)
-    status       # idle / busy
+    status       # idle / busy / off
     heartbeat    # Worker heartbeat (epoch seconds)
-    pid          # Worker process ID
+    workdir      # Working directory for commands
     output/
       *.log      # Job output files
+```
+
+Local state (`/tmp/rema/`, per-machine, cleared on reboot):
+```
+/tmp/rema/
+  <name>/
+    pid          # Worker process ID
+    worker.log   # Worker process log (crash info, etc.)
 ```

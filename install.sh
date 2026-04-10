@@ -62,7 +62,20 @@ else
   fi
 fi
 
-# 4. Source config reminder
+# 4. Source config in shell
+if grep -qs "source.*rema_config" "$HOME/.bashrc" 2>/dev/null; then
+  echo "~/.bashrc already sources rema_config"
+else
+  echo ""
+  read -rp "Add 'source $CONFIG_FILE' to ~/.bashrc? [y/N] " append_source
+  if [ "$append_source" = "y" ] || [ "$append_source" = "Y" ]; then
+    echo "" >> "$HOME/.bashrc"
+    echo "# rema config" >> "$HOME/.bashrc"
+    echo "source $CONFIG_FILE" >> "$HOME/.bashrc"
+    echo "Added to ~/.bashrc"
+  fi
+fi
+
 echo ""
 echo "=== Installation complete ==="
 echo ""
@@ -70,10 +83,9 @@ echo "REMA_DIR: $rema_dir"
 echo "Commands will be executed in the directory containing .rema/"
 echo "  (i.e. $(dirname "$rema_dir"))"
 echo ""
-echo "To activate, add to your shell config (~/.bashrc):"
-echo "  source $CONFIG_FILE"
-echo ""
-echo "Or run: source $CONFIG_FILE"
+echo "To activate now, run:"
+echo "  source ~/.rema_config"
+echo "  source ~/.bashrc"
 echo ""
 echo "Usage:"
 echo "  rema start <name>         Start worker on this machine"
