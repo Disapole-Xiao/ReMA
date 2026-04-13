@@ -101,6 +101,7 @@ _worker_loop() {
   local last_job_id=""
   local last_mtime=0
   local last_size=0
+  local job_pid=0
 
   mkdir -p "$sdir/output"
   mkdir -p "$ldir"
@@ -124,14 +125,61 @@ _worker_loop() {
   while true; do
     # Exit if removed remotely (rm) or locally (stop)
     if [ ! -d "$sdir" ] || [ ! -d "$ldir" ]; then
+      [ "$job_pid" -gt 0 ] && kill "$job_pid" 2>/dev/null
       exit 0
     fi
 
     # Update heartbeat (in shared dir)
     update_heartbeat "$sdir"
 
-    # Change detection: compare mtime and size
-    if [ -f "$cmd_file" ]; then
+    # Check for kill marker
+    if [ "$job_pid" -gt 0 ] && [ -f "$sdir/job.kill" ]; then
+      rm -f "$sdir/job.kill"
+      # Kill the job process (and its children via process group)
+      kill "$job_pid" 2>/dev/null
+      wait "$job_pid" 2>/dev/null
+
+      local current_job_id
+      current_job_id=$(read_cmd_field "$sdir/job" "JOB_ID")
+      if [ -n "$current_job_id" ]; then
+        {
+          echo ""
+          echo "=== killed: $(date '+%Y-%m-%d %H:%M:%S') ==="
+          echo "REMA_DONE:137"
+        } >> "$sdir/output/${current_job_id}.log"
+      fi
+
+      rm -f "$sdir/job"
+      echo "idle" > "$sdir/status"
+      job_pid=0
+    fi
+
+    # Check if current job finished
+    if [ "$job_pid" -gt 0 ]; then
+      if ! kill -0 "$job_pid" 2>/dev/null; then
+        # Job process ended, collect exit code
+        wait "$job_pid" 2>/dev/null
+        local exit_code=$?
+
+        # Find the current job's logfile from the job file
+        local current_job_id
+        current_job_id=$(read_cmd_field "$sdir/job" "JOB_ID")
+        if [ -n "$current_job_id" ]; then
+          {
+            echo ""
+            echo "=== ended: $(date '+%Y-%m-%d %H:%M:%S') ==="
+            echo "REMA_DONE:${exit_code}"
+          } >> "$sdir/output/${current_job_id}.log"
+        fi
+
+        rm -f "$sdir/job"
+        echo "idle" > "$sdir/status"
+        job_pid=0
+      fi
+    fi
+
+    # Change detection: compare mtime and size (only when idle)
+    if [ "$job_pid" -eq 0 ] && [ -f "$cmd_file" ]; then
       local curr_mtime curr_size
       curr_mtime=$(stat -c%Y "$cmd_file" 2>/dev/null || echo 0)
       curr_size=$(stat -c%s "$cmd_file" 2>/dev/null || echo 0)
@@ -150,7 +198,12 @@ _worker_loop() {
           # Clean old logs before executing
           clean_old_logs "$sdir"
 
-          # Execute
+          # Write job info to shared dir
+          {
+            echo "JOB_ID=${job_id}"
+            echo "COMMAND=${command}"
+          } > "$sdir/job"
+
           echo "busy" > "$sdir/status"
           local logfile="$sdir/output/${job_id}.log"
 
@@ -161,17 +214,9 @@ _worker_loop() {
             echo ""
           } > "$logfile"
 
-          bash -c "$command" >> "$logfile" 2>&1
-          local exit_code
-          exit_code=$?
-
-          {
-            echo ""
-            echo "=== ended: $(date '+%Y-%m-%d %H:%M:%S') ==="
-            echo "REMA_DONE:${exit_code}"
-          } >> "$logfile"
-
-          echo "idle" > "$sdir/status"
+          # Execute in background
+          bash -c "$command" >> "$logfile" 2>&1 &
+          job_pid=$!
         fi
       fi
     fi
@@ -259,6 +304,7 @@ cmd_run() {
   local status
   status=$(get_status "$sdir")
   [ "$status" = "off" ] && die "worker '$name' is not running (status: off)"
+  [ "$status" = "busy" ] && die "worker '$name' is busy"
 
   # Generate job_id and write cmd file
   local job_id
@@ -326,6 +372,55 @@ cmd_log() {
   fi
 
   cat "$logfile"
+}
+
+cmd_kill() {
+  local name="${1:-}"
+  [ -z "$name" ] && die "usage: rema kill <name>"
+
+  check_dir
+  local sdir
+  sdir=$(machine_dir "$name")
+
+  [ ! -d "$sdir" ] && die "machine '$name' not found"
+
+  local status
+  status=$(get_status "$sdir")
+  [ "$status" != "busy" ] && die "worker '$name' is not busy (status: $status)"
+
+  # Read job info from shared dir
+  if [ ! -f "$sdir/job" ]; then
+    die "no job file found for '$name'"
+  fi
+
+  local job_id
+  job_id=$(read_cmd_field "$sdir/job" "JOB_ID")
+  [ -z "$job_id" ] && die "could not read job_id from job file"
+
+  local logfile="$sdir/output/${job_id}.log"
+
+  # Write interrupt marker — worker will detect this and kill the job process
+  echo "KILL" > "$sdir/job.kill"
+
+  # Wait for status to change from busy
+  local waited=0
+  while [ "$(get_status "$sdir")" = "busy" ] && [ "$waited" -lt 15 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if [ "$(get_status "$sdir")" = "busy" ]; then
+    echo "rema: warning: worker '$name' still busy after kill signal"
+  else
+    echo "rema: job killed on '$name'"
+  fi
+
+  # Show the log with kill marker
+  if [ -f "$logfile" ]; then
+    echo ""
+    echo "--- job output ---"
+    cat "$logfile"
+  fi
 }
 
 cmd_stop() {
@@ -433,9 +528,9 @@ Usage:
   rema start <name>                Start worker on this machine
   rema stop <name>                 Stop worker on this machine
   rema status <name>               Check machine status
-  rema run <name> -- <command>     Execute command (sync, real-time output)
-  rema run <name> --async -- <command>  Execute command (async, immediate return)
+  rema run <name> [--async] -- <command>  Execute command
   rema log <name> [job_id]         Show job output
+  rema kill <name>                 Kill running job on a machine
   rema list                        List all machines and their status
   rema rm <name>                   Remove a machine (must be off)
 
@@ -456,6 +551,7 @@ main() {
     status)   cmd_status "$@" ;;
     run)      cmd_run "$@" ;;
     log)      cmd_log "$@" ;;
+    kill)     cmd_kill "$@" ;;
     list)     cmd_list "$@" ;;
     rm)       cmd_rm "$@" ;;
     -h|--help)    usage ;;
