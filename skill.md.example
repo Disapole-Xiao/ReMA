@@ -1,21 +1,29 @@
 ---
 name: rema
-description: Use when executing commands, training, or checking GPU status on remote machines via shared mount. Remote machine must have a worker running (`rema start`). Source: https://github.com/Disapole-Xiao/ReMA | Local: /workspace/images-ks3-hd/workspace/xiaozihan/code/rema
+description: Execute commands, run training, and check GPU status on remote machines through a shared mount using ReMA. Requires a running worker on the target machine.
 ---
 
 # ReMA — Remote Machine Access
 
 Execute commands on remote machines through a shared mount. All machines must mount the same data volume.
 
+Source: https://github.com/Disapole-Xiao/ReMA
+Local checkout: `/path/to/ReMA` (replace with your repository location).
+
 ## Quick Reference
 
 | Command | Description |
 |---------|-------------|
 | `rema start <name>` | Start worker in current directory |
-| `rema stop <name>` | Stop worker |
+| `rema stop <name>` | Stop accepting jobs, wait for running jobs, then exit |
+| `rema stop <name> -f` | Terminate this worker's jobs, then exit |
+| `rema restart <name> [-f]` | Restart the remote worker in its original directory; drain jobs, or terminate them with `-f` |
 | `rema status <name>` | idle / busy / off |
 | `rema run <name> -- <cmd>` | Sync: real-time output, wait for completion |
 | `rema run <name> --async -- <cmd>` | Async: submit and return immediately |
+| `rema jobs <name>` | List only running jobs |
+| `rema jobs <name> -a` | List all jobs, including queued tasks and history (`--all` also works) |
+| `rema kill <name> <job_id>` | Terminate a running job; job ID is mandatory |
 | `rema log <name>` | Show latest job output |
 | `rema log <name> <job_id>` | Show specific job output |
 | `rema list` | Show all machines and status |
@@ -52,6 +60,23 @@ rema log <name>
 - `rema list` shows all registered machines; `off` means worker is not running or heartbeat expired
 - Each job gets a unique ID; use `rema log <name> <job_id>` for specific jobs
 - To remove a machine, it must be `off` — run `rema stop` first if idle/busy
+- `busy` is informational: new sync and async jobs can execute concurrently
+- `kill` requires a job ID; it targets only that job's process group
+- `stop` drains running jobs; `stop -f` terminates all jobs owned by this worker
+- Heartbeat updates synchronously in the worker loop
+- Restart accepts only new submissions; old queued or incomplete jobs never run again automatically
+- Historical logs remain readable; the default log is selected by submission order
+- Normal submissions require protocol 2. Follow the user's requested development branch/directory and isolate test state from live workers.
+
+## Existing installations and remote restart
+
+- An installed CLI symlink follows changes to the same repository path. Running workers load new code only after restart. Check `rema list` first, then `rema restart <name>` from any host sharing storage. This restarts ReMA, not the operating system; offline workers still require host access to start.
+- Default restart closes new submissions, drains running tasks, and starts in the original working directory. `restart <name> -f` terminates only that worker's tracked jobs; it can escalate an existing graceful restart. Earlier jobs are never replayed. Interrupting the client after handoff does not cancel restart.
+- The command stages the calling CLI's code on shared storage and runs a detached helper on the worker host. It supports the initial remote upgrade from early protocol-2 workers and legacy protocol-1 workers. Legacy upgrade is graceful only (`-f` is rejected); finish submitting through old clients first because they cannot honor the new restart lock.
+- Restart upgrades the worker, without rewriting the target host's installed CLI path. It preserves other inherited environment variables and saved explicit ReMA overrides, while reloading current config/defaults. Workers predating saved overrides reload ReMA settings from config/defaults; persist any old shell-only customization in the target config before the first upgrade.
+- Check the target's `protocol`, `version`, and `poll_interval` files in `$REMA_DIR/<name>/`; client `--version` alone does not identify worker code. The default worker interval is 5 seconds, plus processing time; client output polling remains 1 second.
+- `start` and `stop` are local to the worker host. Do not run a worker's own `stop` or `restart` synchronously through its `rema run`; use `rema restart <name>` directly from the client.
+- Keep the recorded working directory, config, and history. Do not use `rm` to upgrade. On restart failure, inspect the printed request directory's `log` and bootstrap job log. A stale `restart.lock` must only be removed after verifying that no helper or replacement startup is active.
 
 ## Environment
 
@@ -61,3 +86,6 @@ Set via `~/.rema_config` or environment variable:
 |----------|---------|-------------|
 | `REMA_DIR` | required | Shared directory path |
 | `REMA_LOG_KEEP_DAYS` | `7` | Auto-delete old logs |
+| `REMA_LOCAL_DIR` | `/tmp/rema` | Local worker state directory |
+| `REMA_POLL_INTERVAL` | `5` | Worker loop sleep in seconds; heartbeat updates in the same loop |
+| `REMA_OUTPUT_POLL_INTERVAL` | `1` | Client output/control polling interval in seconds |

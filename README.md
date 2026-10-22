@@ -6,6 +6,14 @@ Execute commands on any machine from anywhere. No network, no SSH — just a sha
 
 ReMA is a lightweight CLI tool that lets you run commands on remote machines through a shared mounted disk. The machines don't need to be connected over the network — they just need to mount the same storage volume (e.g., JuiceFS, NFS, or any shared disk).
 
+One worker can run multiple commands concurrently. `busy` reports that jobs are
+running; it does not prevent submissions. Each job has its own Bash process group,
+output log, state, and exit code. Sync and async select how the client waits, not
+whether the worker can execute other commands.
+
+Runtime requirements: Linux, Bash 4.4+, GNU core utilities, and `setsid`
+(util-linux). Python 3 is needed only for the integration tests.
+
 It works like a simplified SSH replacement for environments where:
 - Machines share a disk but can't reach each other over the network
 - You want to run commands on a GPU machine from a dev machine
@@ -19,9 +27,8 @@ git clone https://github.com/Disapole-Xiao/ReMA.git
 cd ReMA
 
 # 2. Run installer
-#    This will create .rema/ in your current directory (e.g., /your/shared/workspace/.rema)
-cd /your/shared/workspace
 bash install.sh
+# When prompted, set REMA_DIR to /your/shared/workspace/.rema
 ```
 
 The installer will:
@@ -90,6 +97,11 @@ rema log gpu-server
 
 # Or check a specific job by ID
 rema log gpu-server 1775844820654_98397_17396
+
+# Inspect running jobs, all records, or terminate one specific running job
+rema jobs gpu-server
+rema jobs gpu-server -a
+rema kill gpu-server <job_id>
 ```
 
 **Step 5: Manage machines**
@@ -97,17 +109,30 @@ rema log gpu-server 1775844820654_98397_17396
 # List all machines
 rema list
 # Output:
-#   NAME                 STATUS     HEARTBEAT
-#   gpu-server           idle       3s ago
+#   NAME                 STATUS     RUNNING  HEARTBEAT
+#   gpu-server           idle       0        3s ago
 
-# Stop the worker
+# Stop accepting submissions and wait for running jobs to finish (on gpu-server)
 rema stop gpu-server
+
+# Or terminate all of this worker's running jobs and stop
+rema stop gpu-server -f
+
+# Restart the remote ReMA worker from any client, keeping its working directory
+rema restart gpu-server
+# Or terminate its tracked jobs before restarting
+rema restart gpu-server -f
 
 # Remove the machine entirely
 rema rm gpu-server
 ```
 
 You can install and start ReMA on as many machines as you want. You can also run multiple workers on the same machine under different names (e.g., `rema start gpu-1` and `rema start gpu-2` on the same host).
+
+Each start creates a new session. Only commands submitted to that session are
+executed. Old queued commands expire, old incomplete execution records become
+`unknown`, and completed jobs are never replayed. Historical logs remain available.
+`kill` always requires a job ID; there is no machine-only shorthand.
 
 
 ## Commands
@@ -121,17 +146,47 @@ See [docs/commands.md](docs/commands.md) for the full command reference with exa
 |----------|---------|-------------|
 | `REMA_DIR` | *(required)* | Shared directory path (e.g., `/path/.rema`). Set automatically by `install.sh`. |
 | `REMA_LOG_KEEP_DAYS` | `7` | Auto-delete job logs older than N days |
+| `REMA_LOCAL_DIR` | `/tmp/rema` | Local worker PID and diagnostic log directory |
+| `REMA_POLL_INTERVAL` | `5` | Worker loop sleep in seconds; heartbeat updates in the same loop |
+| `REMA_OUTPUT_POLL_INTERVAL` | `1` | Client output/control polling interval in seconds |
 
 ReMA reads settings from `~/.rema_config`. You can also override them via environment variables. Priority: **environment variable** > `~/.rema_config` > default value.
 
+Log retention applies only to finished, cancelled, or expired jobs. Running and
+unknown job logs are preserved. `rema log <name>` selects the most recently
+submitted job, not whichever running job last wrote output.
+
+## Development and upgrades
+
+The concurrent worker uses protocol version 2. After updating the client, use
+`rema restart <name>` to load that client's code on the remote worker. This works
+with early protocol-2 workers and with legacy workers (graceful upgrade only).
+It restarts ReMA, not the host OS, and requires a reachable, running worker.
+Working directory and history are preserved; existing commands never replay.
+See [restart details](docs/commands.md#restart-and-removal) for configuration and
+legacy-client behavior. The remote host's installed CLI is not rewritten.
+
+Develop in the branch and directory requested by the user, with separate worker
+names and state directories for tests. Running workers need restart to load
+changes; ordinary CLI invocations follow updates to their installed symlink.
+
+Run `bash test_rema.sh` from this checkout. Tests snapshot this checkout's script
+and use isolated shared/local directories and worker names, never the installed
+`rema` or its registered machines. Set `REMA_TEST_TMPDIR` to choose the test-data
+parent directory. The printed test directory is retained for diagnostics.
+
 
 ## Uninstallation
+
+Stop each local worker on its own host with `rema stop <name>` before
+uninstalling. Then, from the repository directory, run:
 
 ```bash
 bash uninstall.sh
 ```
 
-This will: stop running workers, remove `~/.local/bin/rema` symlink, remove `~/.rema_config`, clean `~/.bashrc`. 
+This removes the `~/.local/bin/rema` symlink and `~/.rema_config`, and cleans
+the ReMA shell entries from `~/.bashrc`.
 
 It does **NOT** delete the shared `.rema/` data directory.
 

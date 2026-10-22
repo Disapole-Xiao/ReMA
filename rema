@@ -1,570 +1,863 @@
 #!/usr/bin/env bash
-# ReMA — Remote Machine Access
-# Execute commands across machines through a shared mount.
+# ReMA — Remote Machine Access through a shared filesystem.
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
+PROTOCOL=2
 
-# Load config if exists
-[ -f "$HOME/.rema_config" ] && . "$HOME/.rema_config"
+# Configuration files supply defaults; explicit environment values win.
+declare -A _rema_env=()
+CONFIG_KEYS=(REMA_DIR REMA_LOCAL_DIR REMA_LOG_KEEP_DAYS REMA_POLL_INTERVAL REMA_OUTPUT_POLL_INTERVAL \
+  REMA_STATUS_TIMEOUT REMA_OUTPUT_LOG_WAIT REMA_CONTROL_TIMEOUT REMA_KILL_GRACE)
+for _rema_key in "${CONFIG_KEYS[@]}"; do
+  if [[ -v $_rema_key ]]; then _rema_env[$_rema_key]="${!_rema_key}"; fi
+done
+[ ! -f "$HOME/.rema_config" ] || . "$HOME/.rema_config"
+for _rema_key in "${!_rema_env[@]}"; do
+  printf -v "$_rema_key" '%s' "${_rema_env[$_rema_key]}"
+done
+unset _rema_key
 
 REMA_DIR="${REMA_DIR:-}"
+REMA_LOCAL_DIR="${REMA_LOCAL_DIR:-/tmp/rema}"
 REMA_LOG_KEEP_DAYS="${REMA_LOG_KEEP_DAYS:-7}"
-REMA_HEARTBEAT_INTERVAL=10
-REMA_STATUS_TIMEOUT=60
-REMA_OUTPUT_POLL_INTERVAL=1
-REMA_OUTPUT_LOG_WAIT=30
-
-# Local state directory (per-machine: pid, worker.log only)
-REMA_LOCAL_DIR="/tmp/rema"
-
-# Work directory for commands: parent directory of REMA_DIR
-REMA_WORKDIR="$(dirname "$REMA_DIR")"
-
-#--- Utility functions ---
+REMA_POLL_INTERVAL="${REMA_POLL_INTERVAL:-5}"
+REMA_OUTPUT_POLL_INTERVAL="${REMA_OUTPUT_POLL_INTERVAL:-1}"
+REMA_STATUS_TIMEOUT="${REMA_STATUS_TIMEOUT:-60}"
+REMA_OUTPUT_LOG_WAIT="${REMA_OUTPUT_LOG_WAIT:-30}"
+REMA_CONTROL_TIMEOUT="${REMA_CONTROL_TIMEOUT:-30}"
+REMA_KILL_GRACE="${REMA_KILL_GRACE:-5}"
+export REMA_DIR REMA_LOCAL_DIR REMA_LOG_KEEP_DAYS REMA_POLL_INTERVAL
+export REMA_OUTPUT_POLL_INTERVAL
+export REMA_STATUS_TIMEOUT REMA_OUTPUT_LOG_WAIT REMA_CONTROL_TIMEOUT REMA_KILL_GRACE
 
 die() { echo "rema: $*" >&2; exit 1; }
+gen_id() { printf '%s_%s_%s_%s' "$(date +%s%3N)" "$$" "$RANDOM" "$RANDOM"; }
+machine_dir() { printf '%s/%s\n' "$REMA_DIR" "$1"; }
+local_dir() { printf '%s/%s\n' "$REMA_LOCAL_DIR" "$1"; }
+read_value() { cat -- "$1" 2>/dev/null; }
 
-# Generate unique job_id: timestamp_pid_random
-gen_job_id() {
-  printf "%s_%s_%s" "$(date +%s%3N)" "$$" "$RANDOM"
+process_alive() {
+  local pid="$1" info
+  [[ $pid =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  info=$(read_value "/proc/$pid/stat") || return 1
+  # An orphaned worker can remain a zombie until the host's init reaps it.
+  case "${info##*) }" in Z*|X*) return 1 ;; *) return 0 ;; esac
 }
 
-# Check REMA_DIR is set
+check_name() {
+  [[ $1 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] || die "invalid name or job ID: $1"
+}
+
 check_dir() {
-  [ -z "$REMA_DIR" ] && die "REMA_DIR not set. Run install.sh or export REMA_DIR manually."
-  mkdir -p "$REMA_DIR"
+  [[ $REMA_DIR = /* ]] || die "REMA_DIR must be an absolute shared directory path"
+  [[ $REMA_LOCAL_DIR = /* ]] || die "REMA_LOCAL_DIR must be an absolute local directory path"
+  local key
+  for key in REMA_LOG_KEEP_DAYS REMA_STATUS_TIMEOUT REMA_OUTPUT_LOG_WAIT REMA_CONTROL_TIMEOUT REMA_KILL_GRACE; do
+    [[ ${!key} =~ ^[0-9]+$ ]] || die "$key must be a nonnegative integer"
+  done
+  for key in REMA_POLL_INTERVAL REMA_OUTPUT_POLL_INTERVAL; do
+    [[ ${!key} =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid $key"
+  done
+  mkdir -p -- "$REMA_DIR" || die "cannot create REMA_DIR"
 }
 
-# Get shared machine directory path (cross-machine communication)
-machine_dir() { echo "$REMA_DIR/$1"; }
-
-# Get local machine directory path (per-machine state)
-local_dir() { echo "$REMA_LOCAL_DIR/$1"; }
-
-# Read a KEY=VALUE field from cmd file
-read_cmd_field() {
-  local file="$1" key="$2"
-  grep "^${key}=" "$file" 2>/dev/null | head -1 | cut -d= -f2-
+# Rename on the same filesystem publishes complete control records.
+write_value() {
+  local target="$1" value="$2" temp
+  temp=$(mktemp "${target}.tmp.XXXXXXXX") || return 1
+  if printf '%s\n' "$value" > "$temp" && mv -fT -- "$temp" "$target"; then return 0; fi
+  rm -f -- "$temp"
+  return 1
 }
 
-# Read heartbeat age in seconds
 heartbeat_age() {
-  local heartbeat_file="$1"
-  local ts
-  ts=$(cat "$heartbeat_file" 2>/dev/null) || { echo 999; return; }
-  echo $(( $(date +%s) - ts ))
+  local stamp
+  stamp=$(read_value "$1") || { echo 999999; return; }
+  [[ $stamp =~ ^[0-9]+$ ]] || { echo 999999; return; }
+  echo "$(( $(date +%s) - stamp ))"
 }
 
-# Get machine status: off / idle / busy
 get_status() {
-  local sdir="$1"
-
-  # Check heartbeat freshness
-  if [ -f "$sdir/heartbeat" ]; then
-    local age
-    age=$(heartbeat_age "$sdir/heartbeat")
-    if [ "$age" -gt "$REMA_STATUS_TIMEOUT" ]; then
-      echo "off"; return
-    fi
-  else
-    echo "off"; return
+  local sdir="$1" status
+  if [ "$(heartbeat_age "$sdir/heartbeat")" -gt "$REMA_STATUS_TIMEOUT" ]; then
+    echo off; return
   fi
-
-  # Read status file
-  local status
-  status=$(cat "$sdir/status" 2>/dev/null) || status="off"
-  echo "$status"
+  status=$(read_value "$sdir/status") || status=off
+  case "$status" in idle|busy) echo "$status" ;; *) echo off ;; esac
 }
 
-# Update heartbeat file
-update_heartbeat() {
-  local sdir="$1"
-  echo "$(date +%s)" > "$sdir/heartbeat"
+check_machine() {
+  check_name "$1"; check_dir
+  [ -d "$(machine_dir "$1")" ] || die "machine '$1' not found"
 }
 
-# Clean old logs
+check_protocol() {
+  [ "$(read_value "$1/protocol")" = "$PROTOCOL" ] ||
+    die "incompatible worker protocol; start a worker with this version (existing workers are unchanged)"
+}
+
+is_terminal() {
+  case "$1" in finished|cancelled|expired|unknown) return 0 ;; *) return 1 ;; esac
+}
+
+job_dir() {
+  local sdir="$1" id="$2"
+  if [ -d "$sdir/jobs/$id" ]; then printf '%s/jobs/%s\n' "$sdir" "$id"
+  elif [ -d "$sdir/pending/$id" ]; then printf '%s/pending/%s\n' "$sdir" "$id"
+  else return 1; fi
+}
+
 clean_old_logs() {
-  local sdir="$1"
-  find "$sdir/output/" -name "*.log" -mtime +${REMA_LOG_KEEP_DAYS} -delete 2>/dev/null || true
-}
-
-#--- Worker loop (internal) ---
-
-_worker_loop() {
-  local name="$1"
-  local sdir ldir
-  sdir=$(machine_dir "$name")
-  ldir=$(local_dir "$name")
-
-  local cmd_file="$sdir/cmd"
-  local last_job_id=""
-  local last_mtime=0
-  local last_size=0
-  local job_pid=0
-
-  mkdir -p "$sdir/output"
-  mkdir -p "$ldir"
-
-  # Read work directory
-  local workdir="$REMA_WORKDIR"
-  [ -f "$sdir/workdir" ] && workdir=$(cat "$sdir/workdir")
-
-  # Check workdir exists before entering loop
-  if [ ! -d "$workdir" ]; then
-    echo "worker '$name' aborted: work directory '$workdir' does not exist" >> "$ldir/worker.log"
-    echo "off" > "$sdir/status"
-    exit 1
-  fi
-
-  cd "$workdir"
-
-  # Write crash info on exit
-  trap 'echo "worker crashed at $(date "+%Y-%m-%d %H:%M:%S"), exit code: $?" >> "$ldir/worker.log"; echo "off" > "$sdir/status"' EXIT
-
-  while true; do
-    # Exit if removed remotely (rm) or locally (stop)
-    if [ ! -d "$sdir" ] || [ ! -d "$ldir" ]; then
-      [ "$job_pid" -gt 0 ] && kill "$job_pid" 2>/dev/null
-      exit 0
-    fi
-
-    # Update heartbeat (in shared dir)
-    update_heartbeat "$sdir"
-
-    # Check for kill marker
-    if [ "$job_pid" -gt 0 ] && [ -f "$sdir/job.kill" ]; then
-      rm -f "$sdir/job.kill"
-      # Kill the job process (and its children via process group)
-      kill "$job_pid" 2>/dev/null
-      wait "$job_pid" 2>/dev/null
-
-      local current_job_id
-      current_job_id=$(read_cmd_field "$sdir/job" "JOB_ID")
-      if [ -n "$current_job_id" ]; then
-        {
-          echo ""
-          echo "=== killed: $(date '+%Y-%m-%d %H:%M:%S') ==="
-          echo "REMA_DONE:137"
-        } >> "$sdir/output/${current_job_id}.log"
-      fi
-
-      rm -f "$sdir/job"
-      echo "idle" > "$sdir/status"
-      job_pid=0
-    fi
-
-    # Check if current job finished
-    if [ "$job_pid" -gt 0 ]; then
-      if ! kill -0 "$job_pid" 2>/dev/null; then
-        # Job process ended, collect exit code
-        wait "$job_pid" 2>/dev/null
-        local exit_code=$?
-
-        # Find the current job's logfile from the job file
-        local current_job_id
-        current_job_id=$(read_cmd_field "$sdir/job" "JOB_ID")
-        if [ -n "$current_job_id" ]; then
-          {
-            echo ""
-            echo "=== ended: $(date '+%Y-%m-%d %H:%M:%S') ==="
-            echo "REMA_DONE:${exit_code}"
-          } >> "$sdir/output/${current_job_id}.log"
-        fi
-
-        rm -f "$sdir/job"
-        echo "idle" > "$sdir/status"
-        job_pid=0
-      fi
-    fi
-
-    # Change detection: compare mtime and size (only when idle)
-    if [ "$job_pid" -eq 0 ] && [ -f "$cmd_file" ]; then
-      local curr_mtime curr_size
-      curr_mtime=$(stat -c%Y "$cmd_file" 2>/dev/null || echo 0)
-      curr_size=$(stat -c%s "$cmd_file" 2>/dev/null || echo 0)
-
-      if [ "$curr_mtime" != "$last_mtime" ] || [ "$curr_size" != "$last_size" ]; then
-        last_mtime="$curr_mtime"
-        last_size="$curr_size"
-
-        local job_id command
-        job_id=$(read_cmd_field "$cmd_file" "JOB_ID")
-        command=$(read_cmd_field "$cmd_file" "COMMAND")
-
-        if [ -n "$job_id" ] && [ "$job_id" != "$last_job_id" ]; then
-          last_job_id="$job_id"
-
-          # Clean old logs before executing
-          clean_old_logs "$sdir"
-
-          # Write job info to shared dir
-          {
-            echo "JOB_ID=${job_id}"
-            echo "COMMAND=${command}"
-          } > "$sdir/job"
-
-          echo "busy" > "$sdir/status"
-          local logfile="$sdir/output/${job_id}.log"
-
-          {
-            echo "=== rema job: $job_id ==="
-            echo "=== command: $command ==="
-            echo "=== started: $(date '+%Y-%m-%d %H:%M:%S') ==="
-            echo ""
-          } > "$logfile"
-
-          # Execute in background
-          bash -c "$command" >> "$logfile" 2>&1 &
-          job_pid=$!
-        fi
-      fi
-    fi
-
-    sleep "$REMA_HEARTBEAT_INTERVAL"
+  local sdir="$1" dir state id
+  for dir in "$sdir/jobs/"*/; do
+    [ -d "$dir" ] || continue
+    state=$(read_value "$dir/state") || continue
+    # Unknown jobs may still have an orphan writing output; never prune those.
+    case "$state" in finished|cancelled|expired)
+      id="${dir%/}"; id="${id##*/}"
+      find "$sdir/output/$id.log" -type f -mtime "+$REMA_LOG_KEEP_DAYS" -delete 2>/dev/null || true ;;
+    esac
   done
 }
 
-#--- Commands ---
+# Worker helpers use the owning loop's local variables (Bash dynamic scope).
+finish_job() {
+  local id="$1" state="$2" code="$3" reason="${4:-}"
+  local dir="$sdir/jobs/$id"
+  if [ -n "$reason" ]; then write_value "$dir/reason" "$reason" || return 1; fi
+  printf '\n=== ended: %s; state: %s; exit code: %s ===\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$state" "$code" >> "$sdir/output/$id.log" || return 1
+  write_value "$dir/exit_code" "$code" && write_value "$dir/state" "$state"
+}
+
+archive_pending() {
+  local path="$1" state="$2" reason="$3" id="${1##*/}"
+  mv -T -- "$path" "$sdir/jobs/$id" || return 1
+  finish_job "$id" "$state" 125 "$reason"
+}
+
+request_cancel() {
+  local id="$1"
+  [ -z "${cancel_at[$id]+present}" ] || return 0
+  cancel_at[$id]=$(date +%s)
+  kill -TERM -- "-${job_pgids[$id]}" 2>/dev/null || true
+}
+
+worker_cleanup() {
+  local code=$? id rc
+  trap - EXIT TERM INT HUP
+  # Handles ordinary signals/errors; SIGKILL/host failure cannot run a trap.
+  if [ "${#job_pids[@]}" -gt 0 ]; then
+    for id in "${!job_pids[@]}"; do request_cancel "$id"; done
+    sleep "$REMA_KILL_GRACE"
+    for id in "${!job_pids[@]}"; do
+      kill -KILL -- "-${job_pgids[$id]}" 2>/dev/null || true
+      wait "${job_pids[$id]}" 2>/dev/null; rc=$?
+      if [ -d "$sdir/jobs/$id" ] && [ "$(read_value "$sdir/session")" = "$session" ]; then
+        finish_job "$id" cancelled "$rc" "worker exited" || true
+      fi
+    done
+  fi
+  if [ "$(read_value "$ldir/session")" = "$session" ]; then rm -f -- "$ldir/pid"; fi
+  if [ -d "$sdir" ] && [ "$(read_value "$sdir/session")" = "$session" ]; then
+    rm -f -- "$sdir/accepting"
+    write_value "$sdir/running" 0 || true
+    write_value "$sdir/status" off || true
+  fi
+  printf 'worker exited at %s, code: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$code"
+}
+
+_worker_loop() {
+  local name="$1" session="$2" workdir="$3" sdir ldir
+  sdir=$(machine_dir "$name"); ldir=$(local_dir "$name")
+  local -A job_pids=() job_pgids=() cancel_at=()
+  local stopping=false force_stop=false previous_count=-1 next_clean=0
+  local path id state now code count
+  set +m  # setsid's child PID is also its new process-group ID.
+  trap worker_cleanup EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  cd -- "$workdir" || exit 1
+  write_value "$sdir/protocol" "$PROTOCOL" || exit 1
+  write_value "$sdir/version" "$VERSION" || exit 1
+  write_value "$sdir/poll_interval" "$REMA_POLL_INTERVAL" || exit 1
+  write_value "$sdir/session" "$session" || exit 1
+  write_value "$sdir/workdir" "$workdir" || exit 1
+  rm -f -- "$sdir/accepting" "$sdir/stop" "$sdir/force-stop"
+
+  # Old sessions are history, never a source of work after restart.
+  for path in "$sdir/pending/"*; do
+    [ -d "$path" ] || continue
+    archive_pending "$path" expired "previous worker session; not replayed" || exit 1
+  done
+  for path in "$sdir/jobs/"*; do
+    [ -d "$path" ] || continue
+    state=$(read_value "$path/state") || state=unknown
+    if ! is_terminal "$state"; then
+      write_value "$path/reason" "previous worker session; execution outcome unknown; not replayed" || exit 1
+      rm -f -- "$path/exit_code" || exit 1
+      write_value "$path/state" unknown || exit 1
+    fi
+  done
+  write_value "$sdir/running" 0 || exit 1
+  write_value "$sdir/status" idle || exit 1
+  write_value "$sdir/heartbeat" "$(date +%s)" || exit 1
+  write_value "$sdir/accepting" "$session" || exit 1
+
+  while true; do
+    [ -d "$sdir" ] && [ -d "$ldir" ] || exit 1
+    [ "$(read_value "$sdir/session")" = "$session" ] || exit 1
+    now=$(date +%s)
+    # Heartbeat is updated synchronously in this same polling loop.
+    write_value "$sdir/heartbeat" "$now" || exit 1
+    if [ "$(read_value "$sdir/stop")" = "$session" ]; then stopping=true; fi
+    if [ "$(read_value "$sdir/force-stop")" = "$session" ]; then stopping=true; force_stop=true; fi
+    if $stopping; then rm -f -- "$sdir/accepting"; fi
+
+    for id in "${!job_pids[@]}"; do
+      if $force_stop || [ -f "$sdir/jobs/$id/kill" ]; then request_cancel "$id"; fi
+      if [ -n "${cancel_at[$id]+present}" ] && [ "$((now - cancel_at[$id]))" -ge "$REMA_KILL_GRACE" ]; then
+        kill -KILL -- "-${job_pgids[$id]}" 2>/dev/null || true
+      fi
+      if ! kill -0 "${job_pids[$id]}" 2>/dev/null; then
+        wait "${job_pids[$id]}" 2>/dev/null; code=$?
+        state=finished
+        if [ -n "${cancel_at[$id]+present}" ]; then
+          # A terminated shell can leave children behind in the same group.
+          kill -KILL -- "-${job_pgids[$id]}" 2>/dev/null || true
+          state=cancelled
+        fi
+        finish_job "$id" "$state" "$code" || exit 1
+        unset 'job_pids[$id]' 'job_pgids[$id]' 'cancel_at[$id]'
+      fi
+    done
+
+    for path in "$sdir/pending/"*; do
+      [ -d "$path" ] || continue
+      id="${path##*/}"
+      if [ "$(read_value "$path/session")" != "$session" ]; then
+        archive_pending "$path" expired "previous worker session; not replayed" || exit 1
+        continue
+      fi
+      # Recheck stop requests while dispatching a batch of new jobs.
+      if $stopping || [ "$(read_value "$sdir/stop")" = "$session" ] ||
+        [ "$(read_value "$sdir/force-stop")" = "$session" ]; then
+        archive_pending "$path" cancelled "worker is stopping; command was not started" || exit 1
+        continue
+      fi
+      mv -T -- "$path" "$sdir/jobs/$id" || exit 1
+      path="$sdir/jobs/$id"
+      {
+        printf '=== rema job: %s ===\n' "$id"
+        printf '=== started: %s ===\n\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+      } > "$sdir/output/$id.log" || exit 1
+      setsid bash "$path/command.sh" </dev/null >> "$sdir/output/$id.log" 2>&1 &
+      job_pids[$id]=$!
+      job_pgids[$id]=${job_pids[$id]}
+      write_value "$path/state" running || exit 1
+    done
+
+    count=${#job_pids[@]}
+    if [ "$count" -ne "$previous_count" ]; then
+      write_value "$sdir/running" "$count" || exit 1
+      if [ "$count" -gt 0 ]; then state=busy; else state=idle; fi
+      write_value "$sdir/status" "$state" || exit 1
+      previous_count=$count
+    fi
+    # Exit here so the EXIT trap still has access to this function's locals.
+    if $stopping && [ "$count" -eq 0 ]; then exit 0; fi
+    if [ "$now" -ge "$next_clean" ]; then clean_old_logs "$sdir"; next_clean=$((now + 3600)); fi
+    sleep "$REMA_POLL_INTERVAL"
+  done
+}
 
 cmd_start() {
-  local name="${1:-}"
-  [ -z "$name" ] && die "usage: rema start <name>"
-
-  check_dir
-  local sdir ldir
-  sdir=$(machine_dir "$name")
-  ldir=$(local_dir "$name")
-  mkdir -p "$sdir/output"
-  mkdir -p "$ldir"
-
-  # Check if already running (via local pid file)
-  if [ -f "$ldir/pid" ]; then
-    local old_pid
-    old_pid=$(cat "$ldir/pid")
-    if kill -0 "$old_pid" 2>/dev/null; then
-      die "worker '$name' is already running (pid: $old_pid)"
-    fi
-    rm -f "$ldir/pid"
+  [ "$#" -eq 1 ] || die "usage: rema start <name>"
+  local name="$1" sdir ldir pid session started key
+  check_name "$name"; check_dir
+  command -v setsid >/dev/null || die "setsid is required (Linux util-linux)"
+  sdir=$(machine_dir "$name"); ldir=$(local_dir "$name")
+  if [ -d "$sdir/restart.lock" ]; then
+    [ -n "${REMA_RESTART_REQUEST_ID:-}" ] &&
+      [ "$(read_value "$sdir/restart.lock/request")" = "$REMA_RESTART_REQUEST_ID" ] ||
+      die "worker '$name' has a remote restart in progress"
   fi
-
-  # Write shared state
-  echo "$PWD" > "$sdir/workdir"
-
-  # Start worker in background (pid and worker.log go to local dir)
-  nohup bash "$0" _worker "$name" </dev/null >> "$ldir/worker.log" 2>&1 &
-  local worker_pid
-  worker_pid=$!
-
-  echo "$worker_pid" > "$ldir/pid"
-  echo "idle" > "$sdir/status"
-  update_heartbeat "$sdir"
-  echo "rema: worker '$name' started (pid: $worker_pid)"
+  unset REMA_RESTART_REQUEST_ID
+  mkdir -p -- "$sdir/pending" "$sdir/jobs" "$sdir/output" "$ldir" || die "cannot create worker directories"
+  # Serialize startup even when two hosts try the same worker name.
+  mkdir -- "$sdir/start.lock" 2>/dev/null || die "startup already in progress for '$name' (start.lock)"
+  _start_lock="$sdir/start.lock"
+  trap 'rmdir -- "$_start_lock" 2>/dev/null || true' EXIT
+  pid=$(read_value "$ldir/pid") || pid=""
+  if process_alive "$pid"; then
+    die "worker '$name' is already running locally (pid: $pid)"
+  fi
+  [ "$(get_status "$sdir")" = off ] || die "worker '$name' is already online"
+  session=$(gen_id)
+  # Preserve actual caller overrides, not resolved defaults, across remote restarts.
+  mkdir -p -- "$ldir/environments/$session" || die "cannot save worker environment"
+  for key in "${!_rema_env[@]}"; do
+    printf '%s' "${_rema_env[$key]}" > "$ldir/environments/$session/$key" || die "cannot save $key"
+  done
+  write_value "$ldir/session" "$session" || die "cannot write local session"
+  nohup bash "$0" _worker "$name" "$session" "$PWD" </dev/null >> "$ldir/worker.log" 2>&1 &
+  pid=$!
+  write_value "$ldir/pid" "$pid" || die "cannot write worker PID"
+  started=$(date +%s)
+  until [ "$(read_value "$sdir/accepting")" = "$session" ]; do
+    process_alive "$pid" || die "worker '$name' failed to start; see $ldir/worker.log"
+    [ "$(( $(date +%s) - started ))" -lt "$REMA_OUTPUT_LOG_WAIT" ] ||
+      die "worker startup timed out; see $ldir/worker.log (pid: $pid)"
+    sleep "$REMA_OUTPUT_POLL_INTERVAL"
+  done
+  rmdir -- "$_start_lock"
+  trap - EXIT
+  echo "rema: worker '$name' started (pid: $pid)"
   echo "rema: work directory: $PWD"
   echo "rema: log: $ldir/worker.log"
 }
 
 cmd_status() {
-  local name="${1:-}"
-  [ -z "$name" ] && die "usage: rema status <name>"
+  [ "$#" -eq 1 ] || die "usage: rema status <name>"
+  check_machine "$1"
+  get_status "$(machine_dir "$1")"
+}
 
-  check_dir
-  local sdir
-  sdir=$(machine_dir "$name")
+accepts_jobs() {
+  local sdir="$1" session="$2"
+  [ "$(get_status "$sdir")" != off ] &&
+    [ ! -d "$sdir/restart.lock" ] &&
+    [ "$(read_value "$sdir/session")" = "$session" ] &&
+    [ "$(read_value "$sdir/accepting")" = "$session" ] &&
+    [ "$(read_value "$sdir/stop")" != "$session" ] &&
+    [ "$(read_value "$sdir/force-stop")" != "$session" ]
+}
 
-  [ ! -d "$sdir" ] && die "machine '$name' not found"
+# Read only a bounded byte range; concurrent appends cannot duplicate output.
+stream_log() {
+  local logfile="$1" size
+  [ -f "$logfile" ] || return 0
+  size=$(stat -c %s -- "$logfile") || return 1
+  if [ "$size" -gt "$output_offset" ]; then
+    dd if="$logfile" bs=65536 iflag=skip_bytes,count_bytes \
+      skip="$output_offset" count="$((size - output_offset))" status=none || return 1
+    output_offset=$size
+  fi
+}
 
-  local status
-  status=$(get_status "$sdir")
-  echo "$status"
+follow_job() {
+  local sdir="$1" id="$2" session="$3" output_offset=0 started dir state code
+  local logfile="$sdir/output/$id.log"
+  started=$(date +%s)
+  while true; do
+    stream_log "$logfile" || die "could not read output (job_id: $id)"
+    dir=$(job_dir "$sdir" "$id") || dir=""
+    state=$(read_value "$dir/state") || state=queued
+    if is_terminal "$state"; then
+      stream_log "$logfile" || die "could not read final output (job_id: $id)"
+      code=$(read_value "$dir/exit_code") || code=125
+      [ "$state" != unknown ] || code=125
+      [[ $code =~ ^[0-9]+$ ]] && [ "$code" -le 255 ] || code=125
+      # Finished jobs already include their exit status in the streamed log.
+      if [ "$state" != finished ]; then
+        printf '\n--- rema: job %s, state: %s, exit code: %s ---\n' "$id" "$state" "$code" >&2
+      fi
+      return "$code"
+    fi
+    if [ "$(get_status "$sdir")" = off ] || [ "$(read_value "$sdir/session")" != "$session" ]; then
+      echo "rema: worker unavailable or restarted; outcome unknown (job_id: $id); inspect jobs/log" >&2
+      return 125
+    fi
+    if [ ! -f "$logfile" ] && [ "$(( $(date +%s) - started ))" -ge "$REMA_OUTPUT_LOG_WAIT" ]; then
+      echo "rema: timeout waiting for job to start (job_id: $id); submission was not cancelled" >&2
+      return 125
+    fi
+    sleep "$REMA_OUTPUT_POLL_INTERVAL"
+  done
 }
 
 cmd_run() {
-  local name="" async_mode=false cmd_parts="" found_dashes=false
-
-  while [ $# -gt 0 ]; do
+  local name="" async=false command="" sdir session id staging
+  while [ "$#" -gt 0 ]; do
     case "$1" in
-      --async) async_mode=true; shift ;;
-      --) shift; cmd_parts="$*"; found_dashes=true; break ;;
+      --async) async=true; shift ;;
+      --) shift; command="$*"; break ;;
       -*) die "unknown option: $1" ;;
-      *) name="$1"; shift ;;
+      *) [ -z "$name" ] || die "usage: rema run <name> [--async] -- <command>"; name="$1"; shift ;;
     esac
   done
-
-  [ -z "$name" ] && die "usage: rema run <name> [--async] -- <command>"
-  [ -z "$cmd_parts" ] && die "usage: rema run <name> [--async] -- <command>"
-
-  check_dir
-  local sdir
+  [ -n "$name" ] && [ -n "$command" ] || die "usage: rema run <name> [--async] -- <command>"
+  check_machine "$name"
   sdir=$(machine_dir "$name")
-
-  [ ! -d "$sdir" ] && die "machine '$name' not found"
-
-  # Check worker status
-  local status
-  status=$(get_status "$sdir")
-  [ "$status" = "off" ] && die "worker '$name' is not running (status: off)"
-  [ "$status" = "busy" ] && die "worker '$name' is busy"
-
-  # Generate job_id and write cmd file
-  local job_id
-  job_id=$(gen_job_id)
-
-  {
-    echo "JOB_ID=${job_id}"
-    echo "COMMAND=${cmd_parts}"
-    echo "TIMESTAMP=$(date +%s)"
-  } > "$sdir/cmd"
-
-  if $async_mode; then
-    echo "rema: job submitted (job_id: $job_id)"
-    return 0
+  [ "$(get_status "$sdir")" != off ] || die "worker '$name' is not running (status: off)"
+  check_protocol "$sdir"
+  session=$(read_value "$sdir/session") || die "worker session unavailable"
+  accepts_jobs "$sdir" "$session" || die "worker '$name' is stopping or unavailable"
+  staging=$(mktemp -d "$sdir/.submit.XXXXXXXXXX") || die "cannot stage job"
+  id="$(gen_id)_${staging##*.submit.}"
+  if ! { printf '%s\n' "$command" > "$staging/command.sh" &&
+    printf '%s\n' "$session" > "$staging/session" &&
+    printf '%s\n' queued > "$staging/state"; }; then
+    rm -rf -- "$staging"; die "cannot write job"
   fi
+  if ! accepts_jobs "$sdir" "$session"; then
+    rm -rf -- "$staging"; die "worker '$name' stopped accepting jobs before submission"
+  fi
+  mv -T -- "$staging" "$sdir/pending/$id" || { rm -rf -- "$staging"; die "cannot publish job"; }
+  if $async; then echo "rema: job submitted (job_id: $id)"; return 0; fi
+  echo "rema: job submitted (job_id: $id)" >&2
+  follow_job "$sdir" "$id" "$session"
+}
 
-  # Sync mode: wait for log file to appear
-  local logfile="$sdir/output/${job_id}.log"
-  local waited=0
-  while [ ! -f "$logfile" ]; do
-    sleep "$REMA_OUTPUT_POLL_INTERVAL"
-    waited=$((waited + 1))
-    if [ "$waited" -ge "$REMA_OUTPUT_LOG_WAIT" ]; then
-      die "timeout waiting for worker '$name' to pick up job (job_id: $job_id)"
-    fi
+cmd_jobs() {
+  local name="" all=false sdir path id state code command
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -a|--all) all=true ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$name" ] || die "usage: rema jobs <name> [-a]"; name="$1" ;;
+    esac
+    shift
   done
-
-  # Follow output
-  local lines_read=0
-  while true; do
-    local total
-    total=$(wc -l < "$logfile" 2>/dev/null) || total=0
-    if [ "$total" -gt "$lines_read" ]; then
-      tail -n +"$((lines_read + 1))" "$logfile"
-      lines_read=$total
-    fi
-    if grep -q "^REMA_DONE:" "$logfile" 2>/dev/null; then
-      local exit_code
-      exit_code=$(grep "^REMA_DONE:" "$logfile" | tail -1 | cut -d: -f2-)
-      echo ""
-      echo "--- rema: job completed, exit code: $exit_code ---"
-      return "$exit_code"
-    fi
-    sleep "$REMA_OUTPUT_POLL_INTERVAL"
+  [ -n "$name" ] || die "usage: rema jobs <name> [-a]"
+  check_machine "$name"
+  sdir=$(machine_dir "$name")
+  printf '%-65s %-12s %-5s %s\n' JOB_ID STATE EXIT COMMAND
+  for path in "$sdir/jobs/"* "$sdir/pending/"*; do
+    [ -d "$path" ] || continue
+    id="${path##*/}"
+    state=$(read_value "$path/state") || state=unknown
+    $all || [ "$state" = running ] || continue
+    code=$(read_value "$path/exit_code") || code=-
+    command=$(tr '\n' ' ' < "$path/command.sh" 2>/dev/null) || command=""
+    printf '%-65s %-12s %-5s %s\n' "$id" "$state" "$code" "$command"
   done
 }
 
 cmd_log() {
-  local name="${1:-}" job_id="${2:-}"
-  [ -z "$name" ] && die "usage: rema log <name> [job_id]"
-
-  check_dir
-  local sdir
-  sdir=$(machine_dir "$name")
-
-  [ ! -d "$sdir" ] && die "machine '$name' not found"
-
-  local logfile
-  if [ -n "$job_id" ]; then
-    logfile="$sdir/output/${job_id}.log"
-    [ ! -f "$logfile" ] && die "log not found: $job_id"
-  else
-    logfile=$(ls -t "$sdir/output/"*.log 2>/dev/null | head -1)
-    [ -z "$logfile" ] && die "no logs found for '$name'"
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: rema log <name> [job_id]"
+  check_machine "$1"
+  local sdir id="${2:-}" path candidate latest=""
+  sdir=$(machine_dir "$1")
+  if [ -z "$id" ]; then
+    # Submission IDs sort chronologically; a long-running old log is not 'latest'.
+    for path in "$sdir/jobs/"* "$sdir/pending/"* "$sdir/output/"*.log; do
+      [ -e "$path" ] || continue
+      candidate="${path##*/}"; candidate="${candidate%.log}"
+      if [[ $candidate > $latest ]]; then latest="$candidate"; fi
+    done
+    id="$latest"
+    [ -n "$id" ] || die "no jobs found for '$1'"
   fi
-
-  cat "$logfile"
+  check_name "$id"
+  if [ -f "$sdir/output/$id.log" ]; then cat -- "$sdir/output/$id.log"
+  elif [ -d "$sdir/pending/$id" ]; then echo "rema: job queued; no output yet (job_id: $id)"
+  else die "log not found: $id"; fi
 }
 
 cmd_kill() {
-  local name="${1:-}"
-  [ -z "$name" ] && die "usage: rema kill <name>"
-
-  check_dir
-  local sdir
-  sdir=$(machine_dir "$name")
-
-  [ ! -d "$sdir" ] && die "machine '$name' not found"
-
-  local status
-  status=$(get_status "$sdir")
-  [ "$status" != "busy" ] && die "worker '$name' is not busy (status: $status)"
-
-  # Read job info from shared dir
-  if [ ! -f "$sdir/job" ]; then
-    die "no job file found for '$name'"
-  fi
-
-  local job_id
-  job_id=$(read_cmd_field "$sdir/job" "JOB_ID")
-  [ -z "$job_id" ] && die "could not read job_id from job file"
-
-  local logfile="$sdir/output/${job_id}.log"
-
-  # Write interrupt marker — worker will detect this and kill the job process
-  echo "KILL" > "$sdir/job.kill"
-
-  # Wait for status to change from busy
-  local waited=0
-  while [ "$(get_status "$sdir")" = "busy" ] && [ "$waited" -lt 15 ]; do
-    sleep 1
-    waited=$((waited + 1))
+  [ "$#" -eq 2 ] || die "usage: rema kill <name> <job_id> (job_id is required)"
+  check_machine "$1"; check_name "$2"
+  local sdir id="$2" dir session started state
+  sdir=$(machine_dir "$1")
+  check_protocol "$sdir"
+  session=$(read_value "$sdir/session") || die "worker session unavailable"
+  dir="$sdir/jobs/$id"
+  [ "$(read_value "$dir/session")" = "$session" ] || die "job '$id' is not in the current worker session"
+  [ "$(read_value "$dir/state")" = running ] || die "job '$id' is not running"
+  [ "$(get_status "$sdir")" != off ] || die "worker '$1' is off; task outcome unknown"
+  write_value "$dir/kill" "$session" || die "cannot request cancellation"
+  started=$(date +%s)
+  while true; do
+    state=$(read_value "$dir/state") || state=unknown
+    if is_terminal "$state"; then
+      [ "$state" = cancelled ] || die "job '$id' ended with state '$state' before cancellation completed"
+      echo "rema: job killed (job_id: $id)"; return 0
+    fi
+    [ "$(get_status "$sdir")" != off ] && [ "$(read_value "$sdir/session")" = "$session" ] ||
+      die "worker unavailable; cancellation outcome unknown (job_id: $id)"
+    [ "$(( $(date +%s) - started ))" -lt "$REMA_CONTROL_TIMEOUT" ] ||
+      die "timed out waiting for cancellation (job_id: $id); request remains pending"
+    sleep "$REMA_OUTPUT_POLL_INTERVAL"
   done
-
-  if [ "$(get_status "$sdir")" = "busy" ]; then
-    echo "rema: warning: worker '$name' still busy after kill signal"
-  else
-    echo "rema: job killed on '$name'"
-  fi
-
-  # Show the log with kill marker
-  if [ -f "$logfile" ]; then
-    echo ""
-    echo "--- job output ---"
-    cat "$logfile"
-  fi
 }
 
 cmd_stop() {
-  local name="${1:-}"
-  [ -z "$name" ] && die "usage: rema stop <name>"
-
-  check_dir
-  local sdir ldir
-  sdir=$(machine_dir "$name")
-  ldir=$(local_dir "$name")
-
-  [ ! -d "$sdir" ] && die "machine '$name' not found"
-
-  if [ ! -f "$ldir/pid" ]; then
-    die "no worker running for '$name' (no pid file)"
-  fi
-
-  local pid
-  pid=$(cat "$ldir/pid")
-
-  if ! kill -0 "$pid" 2>/dev/null; then
-    echo "rema: worker '$name' is not running (stale pid file cleaned)"
-    rm -f "$ldir/pid"
-    echo "off" > "$sdir/status"
-    return 0
-  fi
-
-  kill "$pid" 2>/dev/null
-  local waited=0
-  while kill -0 "$pid" 2>/dev/null; do
-    sleep 1
-    waited=$((waited + 1))
-    if [ "$waited" -ge 5 ]; then
-      kill -9 "$pid" 2>/dev/null
-      break
-    fi
+  local name="" force=false sdir ldir session pid
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -f) force=true ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$name" ] || die "usage: rema stop <name> [-f]"; name="$1" ;;
+    esac
+    shift
   done
-
-  rm -f "$ldir/pid"
-  echo "off" > "$sdir/status"
+  [ -n "$name" ] || die "usage: rema stop <name> [-f]"
+  check_machine "$name"
+  sdir=$(machine_dir "$name"); ldir=$(local_dir "$name")
+  session=$(read_value "$ldir/session") || die "no local worker session for '$name'"
+  [ "$(read_value "$sdir/session")" = "$session" ] || die "local worker session does not own '$name'"
+  check_protocol "$sdir"
+  pid=$(read_value "$ldir/pid") || die "no worker running for '$name' (no pid file)"
+  process_alive "$pid" || die "worker '$name' is not running"
+  # Separate monotonic markers prevent a graceful request from undoing -f.
+  if $force; then write_value "$sdir/force-stop" "$session" || die "cannot request force stop"
+  else write_value "$sdir/stop" "$session" || die "cannot request stop"; fi
+  echo "rema: worker '$name' stopping; no new submissions accepted"
+  while [ "$(read_value "$sdir/status")" != off ]; do
+    [ "$(read_value "$sdir/session")" = "$session" ] || die "worker session changed while stopping"
+    if ! process_alive "$pid"; then
+      [ "$(read_value "$sdir/status")" = off ] && break
+      die "worker exited unexpectedly; inspect jobs/log"
+    fi
+    [ "$(heartbeat_age "$sdir/heartbeat")" -le "$REMA_STATUS_TIMEOUT" ] ||
+      die "worker heartbeat expired while stopping; inspect jobs/log"
+    sleep "$REMA_OUTPUT_POLL_INTERVAL"
+  done
   echo "rema: worker '$name' stopped"
 }
 
-cmd_list() {
-  check_dir
+# Restart helpers run on the worker host, reached through an ordinary job.
+# /proc start time prevents a recycled PID from being treated as this worker.
+process_field() {
+  local info
+  local -a fields
+  info=$(read_value "/proc/$1/stat") || return 1
+  read -r -a fields <<< "${info##*) }"
+  printf '%s\n' "${fields[$2]}"
+}
 
-  local first=true
-  for sdir in "$REMA_DIR"/*/; do
-    [ -d "$sdir" ] || continue
-    [ -f "$sdir/status" ] || continue
-    local name
-    name=$(basename "$sdir")
-
-    $first && { printf "%-20s %-10s %s\n" "NAME" "STATUS" "HEARTBEAT"; first=false; }
-
-    local status age_text="-"
-    status=$(get_status "$sdir")
-
-    if [ -f "$sdir/heartbeat" ]; then
-      local age
-      age=$(heartbeat_age "$sdir/heartbeat")
-      if [ "$age" -lt 60 ]; then
-        age_text="${age}s ago"
-      elif [ "$age" -lt 3600 ]; then
-        age_text="$((age / 60))m ago"
-      else
-        age_text="$((age / 3600))h ago"
-      fi
-    fi
-
-    printf "%-20s %-10s %s\n" "$name" "$status" "$age_text"
-  done
-
-  if $first; then
-    echo "no machines found"
+restart_unlock() {
+  if [ "$(read_value "$sdir/restart.lock/request")" = "$request_id" ]; then
+    rm -f -- "$sdir/restart.lock/request"
+    rmdir -- "$sdir/restart.lock" 2>/dev/null || true
   fi
 }
 
-cmd_rm() {
-  local name="${1:-}"
-  [ -z "$name" ] && die "usage: rema rm <name>"
-
-  check_dir
-  local sdir
-  sdir=$(machine_dir "$name")
-
-  [ ! -d "$sdir" ] && die "machine '$name' not found"
-
-  # Only allow removing off workers
-  local status
-  status=$(get_status "$sdir")
-  [ "$status" != "off" ] && die "worker '$name' is $status, run 'rema stop $name' first"
-
-  rm -rf "$sdir"
-  echo "rema: machine '$name' removed"
+restart_cleanup() {
+  local code=$?
+  trap - EXIT TERM INT HUP
+  if ${paused:-false} && restart_old_alive; then kill -CONT "$pid" 2>/dev/null || true; fi
+  if [ "$(read_value "$request/state")" != done ]; then
+    write_value "$request/state" failed || true
+    printf 'restart failed (exit %s); inspect this log and worker.log\n' "$code" >&2
+  fi
+  restart_unlock
 }
 
-#--- Main ---
+restart_tick() {
+  write_value "$request/heartbeat" "$(date +%s)" || die "cannot update restart heartbeat"
+  sleep "$REMA_OUTPUT_POLL_INTERVAL"
+}
+
+restart_old_alive() {
+  process_alive "$pid" && [ "$(process_field "$pid" 19)" = "$token" ]
+}
+
+restart_check_owner() {
+  [ "$(read_value "$ldir/pid")" = "$pid" ] || die "local worker PID changed during restart"
+  restart_old_alive || die "old worker exited unexpectedly during restart"
+  if [ "$protocol" = 2 ]; then
+    [ "$(read_value "$sdir/session")" = "$session" ] &&
+      [ "$(read_value "$ldir/session")" = "$session" ] || die "worker session changed during restart"
+  fi
+}
+
+_restart_handoff() {
+  local name="$1" request_id="$2" sdir ldir request pid token ancestor protocol session
+  check_machine "$name"; check_name "$request_id"
+  sdir=$(machine_dir "$name"); ldir=$(local_dir "$name"); request="$sdir/restarts/$request_id"
+  [ "$(read_value "$sdir/restart.lock/request")" = "$request_id" ] || die "restart request is no longer active"
+  trap restart_cleanup EXIT
+  pid=$(read_value "$ldir/pid") || die "cannot find worker PID on target host"
+  token=$(process_field "$pid" 19) || die "cannot identify worker process"
+  protocol=$(read_value "$request/protocol"); session=$(read_value "$request/session")
+  restart_check_owner
+  # The PID must be an ancestor of this job, not an unrelated local PID file.
+  ancestor=$PPID
+  while [ "$ancestor" != "$pid" ]; do
+    [[ $ancestor =~ ^[0-9]+$ ]] && [ "$ancestor" -gt 1 ] || die "PID does not own this restart job"
+    ancestor=$(process_field "$ancestor" 1) || die "cannot verify worker ancestry"
+  done
+  write_value "$request/worker_pid" "$pid" && write_value "$request/worker_token" "$token" &&
+    write_value "$request/workdir" "$PWD" && write_value "$request/state" handoff &&
+    write_value "$request/heartbeat" "$(date +%s)" || die "cannot save restart handoff"
+  # A separate session survives cancellation/exit of the bootstrap job.
+  nohup setsid bash "$request/script" _restart_finish "$name" "$request_id" \
+    </dev/null >> "$request/log" 2>&1 &
+  trap - EXIT
+}
+
+_restart_finish() {
+  local name="$1" request_id="$2" sdir ldir request pid token protocol session job state started key
+  local -a start_env=(env)
+  local paused=false
+  sdir=$(machine_dir "$name"); ldir=$(local_dir "$name"); request="$sdir/restarts/$request_id"
+  trap restart_cleanup EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  pid=$(read_value "$request/worker_pid"); token=$(read_value "$request/worker_token")
+  protocol=$(read_value "$request/protocol"); session=$(read_value "$request/session")
+  job=$(read_value "$request/job_id")
+  # Never ask the worker to drain while it is still tracking our bootstrap job.
+  while true; do
+    restart_check_owner
+    if [ "$protocol" = 2 ]; then
+      state=$(read_value "$sdir/jobs/$job/state") || state=queued
+      if is_terminal "$state"; then
+        [ "$state" = finished ] && [ "$(read_value "$sdir/jobs/$job/exit_code")" = 0 ] ||
+          die "restart bootstrap did not complete successfully"
+        break
+      fi
+    elif grep -qx 'REMA_DONE:0' "$sdir/output/$job.log" 2>/dev/null; then break
+    fi
+    restart_tick
+  done
+  write_value "$request/state" draining || die "cannot record restart phase"
+  if [ "$protocol" = 2 ]; then
+    write_value "$sdir/stop" "$session" || die "cannot request worker stop"
+    while true; do
+      [ "$(read_value "$sdir/session")" = "$session" ] || die "worker session changed while draining"
+      [ "$(read_value "$sdir/status")" != off ] || break
+      if ! restart_old_alive; then
+        [ "$(read_value "$sdir/status")" = off ] && break
+        die "old worker exited unexpectedly while draining"
+      fi
+      if [ -f "$request/force" ]; then
+        write_value "$sdir/force-stop" "$session" || die "cannot request force stop"
+      fi
+      [ "$(heartbeat_age "$sdir/heartbeat")" -le "$REMA_STATUS_TIMEOUT" ] || die "worker heartbeat expired while draining"
+      restart_tick
+    done
+  else
+    # Legacy workers lack isolated job groups: only a graceful upgrade is safe.
+    # Freeze dispatch before checking idle, so a newly started job is never killed.
+    while true; do
+      restart_check_owner
+      if [ "$(read_value "$sdir/status")" = idle ] && [ ! -f "$sdir/job" ]; then
+        kill -STOP "$pid" || die "cannot pause legacy dispatcher"
+        paused=true
+        while [ "$(process_field "$pid" 0)" != T ]; do
+          restart_old_alive || die "legacy dispatcher exited before stopping"
+          sleep "$REMA_OUTPUT_POLL_INTERVAL"
+        done
+        if [ "$(read_value "$sdir/status")" = idle ] && [ ! -f "$sdir/job" ]; then
+          kill -TERM "$pid"; kill -CONT "$pid"
+          paused=false
+          break
+        fi
+        kill -CONT "$pid"
+        paused=false
+      fi
+      restart_tick
+    done
+  fi
+  started=$(date +%s)
+  while restart_old_alive; do
+    # Only legacy workers need a signal; protocol 2 exits through its own cleanup.
+    if [ "$protocol" = 1 ] && [ "$(( $(date +%s) - started ))" -ge "$REMA_KILL_GRACE" ]; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    restart_tick
+  done
+  if [ "$protocol" = 1 ]; then
+    [ "$(read_value "$ldir/pid")" = "$pid" ] || die "legacy PID changed while stopping"
+    rm -f -- "$ldir/pid"
+    write_value "$sdir/status" off || die "cannot record legacy stop"
+  fi
+  write_value "$request/state" starting || die "cannot record restart phase"
+  cd -- "$(read_value "$request/workdir")" || die "original working directory is unavailable"
+  # Reload current defaults/config, preserving only saved explicit overrides.
+  # Pre-upgrade workers lack provenance, so their exported old defaults are dropped.
+  for key in "${CONFIG_KEYS[@]}"; do start_env+=(-u "$key"); done
+  for key in "${CONFIG_KEYS[@]}"; do
+    if [ -f "$ldir/environments/$session/$key" ]; then
+      start_env+=("$key=$(read_value "$ldir/environments/$session/$key")")
+    fi
+  done
+  start_env+=("REMA_DIR=$REMA_DIR" "REMA_LOCAL_DIR=$REMA_LOCAL_DIR" "REMA_RESTART_REQUEST_ID=$request_id")
+  "${start_env[@]}" bash "$request/script" start "$name" || die "replacement worker failed to start"
+  session=$(read_value "$sdir/session") || die "new session missing"
+  [ "$(read_value "$sdir/accepting")" = "$session" ] || die "replacement worker is not ready"
+  write_value "$request/new_session" "$session" && write_value "$request/state" done || die "cannot record restart completion"
+  exit 0
+}
+
+cmd_restart() {
+  local name="" force=false sdir request request_id session protocol id staging command state old_id mtime
+  local missing_since=0 now
+  local published=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -f) force=true ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$name" ] || die "usage: rema restart <name> [-f]"; name="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die "usage: rema restart <name> [-f]"
+  check_machine "$name"; sdir=$(machine_dir "$name")
+  if [ -d "$sdir/restart.lock" ]; then
+    request_id=$(read_value "$sdir/restart.lock/request") || die "restart lock is initializing or stale; inspect $sdir/restart.lock"
+    check_name "$request_id"; request="$sdir/restarts/$request_id"
+    protocol=$(read_value "$request/protocol")
+  else
+    [ "$(get_status "$sdir")" != off ] || die "worker '$name' is offline; remote restart requires a running worker"
+    protocol=$(read_value "$sdir/protocol") || protocol=1
+    case "$protocol" in 1|2) ;; *) die "unsupported worker protocol: $protocol" ;; esac
+    if $force && [ "$protocol" = 1 ]; then die "legacy workers support only graceful restart (no -f)"; fi
+    session=$(read_value "$sdir/session") || session=legacy
+    if [ "$protocol" = 2 ]; then
+      accepts_jobs "$sdir" "$session" || die "worker is already stopping or unavailable"
+    fi
+    mkdir -p -- "$sdir/restarts" || die "cannot create restart directory"
+    request=$(mktemp -d "$sdir/restarts/$(gen_id)_XXXXXXXX") || die "cannot stage restart"
+    request_id=${request##*/}
+    cp -- "$0" "$request/script" &&
+      write_value "$request/protocol" "$protocol" && write_value "$request/session" "$session" &&
+      write_value "$request/state" preparing || die "cannot stage restart code"
+    mkdir -- "$sdir/restart.lock" 2>/dev/null || die "another restart is being submitted; retry to join it"
+    write_value "$sdir/restart.lock/request" "$request_id" || { rmdir "$sdir/restart.lock"; die "cannot record restart lock"; }
+    trap 'if ! $published; then write_value "$request/state" failed; restart_unlock; fi' EXIT
+    if $force; then write_value "$request/force" yes || die "cannot request force restart"; fi
+    id=$(gen_id)
+    write_value "$request/job_id" "$id" || die "cannot save bootstrap job ID"
+    printf -v command 'bash %q _restart_handoff %q %q' "$request/script" "$name" "$request_id"
+    if [ "$protocol" = 2 ]; then
+      staging=$(mktemp -d "$sdir/.submit.XXXXXXXXXX") || die "cannot stage restart job"
+      printf '%s\n' "$command" > "$staging/command.sh"
+      printf '%s\n' "$session" > "$staging/session"
+      printf '%s\n' queued > "$staging/state"
+      [ "$(read_value "$sdir/session")" = "$session" ] && [ "$(get_status "$sdir")" != off ] || die "worker changed before restart submission"
+      write_value "$request/state" queued || die "cannot record restart phase"
+      mv -T -- "$staging" "$sdir/pending/$id" || die "cannot submit restart bootstrap"
+    else
+      # Do not overwrite a legacy single-slot request that has not finished.
+      while true; do
+        [ "$(get_status "$sdir")" != off ] || die "legacy worker went offline before handoff"
+        old_id=$(sed -n 's/^JOB_ID=//p' "$sdir/cmd" 2>/dev/null | head -n 1)
+        if [ "$(read_value "$sdir/status")" = idle ] && [ ! -f "$sdir/job" ]; then
+          if [ ! -f "$sdir/cmd" ] || { [ -n "$old_id" ] && grep -q '^REMA_DONE:' "$sdir/output/$old_id.log" 2>/dev/null; }; then break; fi
+        fi
+        sleep "$REMA_OUTPUT_POLL_INTERVAL"
+      done
+      mtime=$(stat -c %Y "$sdir/cmd" 2>/dev/null) || mtime=0
+      while [ "$(date +%s)" -le "$mtime" ]; do sleep "$REMA_OUTPUT_POLL_INTERVAL"; done
+      staging=$(mktemp "$sdir/.restart-cmd.XXXXXXXX") || die "cannot stage legacy restart"
+      printf 'JOB_ID=%s\nCOMMAND=%s\nTIMESTAMP=%s\n' "$id" "$command" "$(date +%s)" > "$staging"
+      write_value "$request/state" queued || die "cannot record restart phase"
+      mv -fT -- "$staging" "$sdir/cmd" || die "cannot submit legacy restart bootstrap"
+    fi
+    published=true
+    trap - EXIT
+  fi
+  if $force; then
+    [ "$protocol" = 2 ] || die "legacy workers support only graceful restart (no -f)"
+    write_value "$request/force" yes || die "cannot escalate restart"
+  fi
+  echo "rema: restarting worker '$name' (request_id: $request_id)"
+  echo "rema: restart diagnostics: $request/log"
+  while true; do
+    if ! state=$(read_value "$request/state") || [ -z "$state" ]; then
+      # Shared mounts may briefly miss another host's atomic rename. A missing
+      # progress record alone does not mean the remote helper failed.
+      now=$(date +%s)
+      [ "$missing_since" -ne 0 ] || missing_since=$now
+      [ "$((now - missing_since))" -lt "$REMA_OUTPUT_LOG_WAIT" ] ||
+        die "restart state unavailable; inspect $request"
+      sleep "$REMA_OUTPUT_POLL_INTERVAL"
+      continue
+    fi
+    missing_since=0
+    case "$state" in
+      done)
+        if [ "$(read_value "$sdir/restart.lock/request")" != "$request_id" ]; then
+          echo "rema: worker '$name' restarted (session: $(read_value "$request/new_session"))"; return 0
+        fi ;;
+      failed) die "restart failed; inspect $request/log and bootstrap job $(read_value "$request/job_id")" ;;
+    esac
+    if [ -f "$request/heartbeat" ]; then
+      [ "$(heartbeat_age "$request/heartbeat")" -le "$((REMA_STATUS_TIMEOUT + REMA_OUTPUT_LOG_WAIT))" ] ||
+        die "restart helper stopped responding; inspect $request before retrying"
+    else
+      [ "$(get_status "$sdir")" != off ] || die "worker went offline before restart handoff; inspect $request"
+      if [ "$protocol" = 2 ]; then
+        id=$(read_value "$request/job_id")
+        state=$(read_value "$sdir/jobs/$id/state") || state=queued
+        if is_terminal "$state" && [ ! -f "$request/heartbeat" ]; then
+          write_value "$request/state" failed; restart_unlock
+          die "restart bootstrap ended before handoff; inspect job $id"
+        fi
+      fi
+    fi
+    sleep "$REMA_OUTPUT_POLL_INTERVAL"
+  done
+}
+
+cmd_list() {
+  [ "$#" -eq 0 ] || die "usage: rema list"
+  check_dir
+  local sdir name status count age first=true
+  for sdir in "$REMA_DIR/"*/; do
+    [ -f "$sdir/status" ] || continue
+    name="${sdir%/}"; name="${name##*/}"
+    if $first; then printf '%-20s %-10s %-8s %s\n' NAME STATUS RUNNING HEARTBEAT; first=false; fi
+    status=$(get_status "$sdir")
+    count=$(read_value "$sdir/running") || count=-
+    [ "$status" != off ] || count=-
+    age=$(heartbeat_age "$sdir/heartbeat")
+    printf '%-20s %-10s %-8s %ss ago\n' "$name" "$status" "$count" "$age"
+  done
+  if $first; then echo "no machines found"; fi
+}
+
+cmd_rm() {
+  [ "$#" -eq 1 ] || die "usage: rema rm <name>"
+  check_machine "$1"
+  local sdir
+  sdir=$(machine_dir "$1")
+  [ ! -d "$sdir/restart.lock" ] || die "worker '$1' has a restart in progress"
+  [ "$(get_status "$sdir")" = off ] || die "worker '$1' is online; run 'rema stop $1' first"
+  rm -rf -- "$sdir"
+  echo "rema: machine '$1' removed"
+}
 
 usage() {
   cat <<'EOF'
 ReMA — Remote Machine Access
 
 Usage:
-  rema start <name>                Start worker on this machine
-  rema stop <name>                 Stop worker on this machine
-  rema status <name>               Check machine status
-  rema run <name> [--async] -- <command>  Execute command
-  rema log <name> [job_id]         Show job output
-  rema kill <name>                 Kill running job on a machine
-  rema list                        List all machines and their status
-  rema rm <name>                   Remove a machine (must be off)
-
-Options:
-  -h, --help       Show this help
-  -V, --version    Show version
+  rema start <name>                     Start worker here; accept only new jobs
+  rema stop <name> [-f]                 Drain jobs, or terminate them with -f
+  rema restart <name> [-f]              Restart remote worker; keep working directory
+  rema status <name>                    Show idle / busy / off
+  rema run <name> [--async] -- <command> Submit a job, including while busy
+  rema jobs <name> [-a]                 List running jobs; -a shows all jobs
+  rema log <name> [job_id]               Show job output (latest if ID omitted)
+  rema kill <name> <job_id>              Terminate one job; ID is required
+  rema list                             List workers and running job counts
+  rema rm <name>                        Remove an off worker and its history
+  rema -h, --help                       Show help
+  rema -V, --version                    Show version
 EOF
 }
 
 main() {
-  [ $# -eq 0 ] && { usage; exit 0; }
-
-  local cmd="$1"; shift
-
-  case "$cmd" in
-    start)    cmd_start "$@" ;;
-    stop)     cmd_stop "$@" ;;
-    status)   cmd_status "$@" ;;
-    run)      cmd_run "$@" ;;
-    log)      cmd_log "$@" ;;
-    kill)     cmd_kill "$@" ;;
-    list)     cmd_list "$@" ;;
-    rm)       cmd_rm "$@" ;;
-    -h|--help)    usage ;;
-    -V|--version) echo "rema $VERSION" ;;
-    *)            die "unknown command: $cmd (see 'rema --help')" ;;
+  [ "$#" -gt 0 ] || { usage; return; }
+  local command="$1"; shift
+  case "$command" in
+    start) cmd_start "$@" ;; stop) cmd_stop "$@" ;; status) cmd_status "$@" ;;
+    restart) cmd_restart "$@" ;;
+    run) cmd_run "$@" ;; jobs) cmd_jobs "$@" ;; log) cmd_log "$@" ;;
+    kill) cmd_kill "$@" ;; list) cmd_list "$@" ;; rm) cmd_rm "$@" ;;
+    -h|--help) usage ;; -V|--version) echo "rema $VERSION" ;;
+    _worker) _worker_loop "$@" ;;
+    _restart_handoff) _restart_handoff "$@" ;; _restart_finish) _restart_finish "$@" ;;
+    *) die "unknown command: $command (see 'rema --help')" ;;
   esac
 }
 
-# If sourced as worker function, _worker_loop is available
-# In normal invocation, this calls main
-if [[ "${1:-}" == "_worker" ]]; then
-  shift
-  _worker_loop "$@"
-else
-  main "$@"
-fi
+main "$@"
