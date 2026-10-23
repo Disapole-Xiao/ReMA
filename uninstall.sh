@@ -9,30 +9,11 @@ REMA_SYMLINK="$INSTALL_DIR/rema"
 
 echo "=== rema uninstaller ==="
 echo ""
+echo "Stop local ReMA workers with 'rema stop <name>' before uninstalling."
+echo ""
 
-# 1. Stop any running workers on this machine
-if [ -f "$CONFIG_FILE" ] && [ -f "$REMA_SYMLINK" ]; then
-  . "$CONFIG_FILE"
-  if [ -n "${REMA_DIR:-}" ] && [ -d "$REMA_DIR" ]; then
-    stopped=0
-    for dir in "$REMA_DIR"/*/; do
-      [ -d "$dir" ] || continue
-      pid_file="$dir/pid"
-      if [ -f "$pid_file" ]; then
-        pid=$(cat "$pid_file")
-        name=$(basename "$dir")
-        if kill -0 "$pid" 2>/dev/null; then
-          kill "$pid" 2>/dev/null
-          echo "Stopped worker '$name' (pid: $pid)"
-          stopped=$((stopped + 1))
-        fi
-      fi
-    done
-    if [ "$stopped" -eq 0 ]; then
-      echo "No running workers found."
-    fi
-  fi
-fi
+# 1. Workers are stopped explicitly with `rema stop <name>` on their own host.
+# Shared state does not identify a local process safely enough to stop it here.
 
 # 2. Remove symlink
 if [ -L "$REMA_SYMLINK" ] || [ -f "$REMA_SYMLINK" ]; then

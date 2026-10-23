@@ -34,23 +34,23 @@ Local checkout: `/path/to/ReMA` (replace with your repository location).
 Before running commands, the remote machine must have a worker running:
 ```bash
 # On remote machine, in the desired working directory:
-rema start <name>
+rema start gpu-server
 ```
 
 Then from any machine:
 ```bash
 # Check status
-rema status <name>
+rema status gpu-server
 
 # Run command (sync, real-time output)
-rema run <name> -- nvidia-smi
-rema run <name> -- "cd project && python train.py"
+rema run gpu-server -- nvidia-smi
+rema run gpu-server -- "cd project && python train.py"
 
 # Run command (async, returns immediately)
-rema run <name> --async -- "sleep 10 && python train.py"
+rema run gpu-server --async -- "sleep 10 && python train.py"
 
 # Check output of async job
-rema log <name>
+rema log gpu-server
 ```
 
 ## Key Behaviors

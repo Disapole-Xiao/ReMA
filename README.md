@@ -1,10 +1,14 @@
 # ReMA — Remote Machine Access
 
-Execute commands on any machine from anywhere. No network, no SSH — just a shared mount.
+Execute commands on other machines through a shared mount, without a direct
+network connection or SSH between them.
 
 ## What is ReMA?
 
-ReMA is a lightweight CLI tool that lets you run commands on remote machines through a shared mounted disk. The machines don't need to be connected over the network — they just need to mount the same storage volume (e.g., JuiceFS, NFS, or any shared disk).
+ReMA is a lightweight CLI tool that lets you run commands on remote machines
+through a shared mounted disk. The machines do not need direct network access to
+each other; they only need to mount the same storage volume (e.g., JuiceFS, NFS,
+or another shared disk).
 
 One worker can run multiple commands concurrently. `busy` reports that jobs are
 running; it does not prevent submissions. Each job has its own Bash process group,
@@ -15,7 +19,7 @@ Runtime requirements: Linux, Bash 4.4+, GNU core utilities, and `setsid`
 (util-linux). Python 3 is needed only for the integration tests.
 
 It works like a simplified SSH replacement for environments where:
-- Machines share a disk but can't reach each other over the network
+- Machines share a disk but cannot connect directly to each other
 - You want to run commands on a GPU machine from a dev machine
 - AI coding agents (Claude Code, Cursor, Copilot) need to execute code on remote hardware
 
@@ -25,6 +29,8 @@ It works like a simplified SSH replacement for environments where:
 # 1. Clone the repo
 git clone https://github.com/Disapole-Xiao/ReMA.git
 cd ReMA
+git fetch origin --tags
+git checkout v1.0.0
 
 # 2. Run installer
 bash install.sh
@@ -88,7 +94,7 @@ rema run gpu-server -- "cd src && python preprocess.py && python train.py"
 ```bash
 # Submit and return immediately
 rema run gpu-server --async -- python train.py --epochs 100
-# Output: rema: job submitted (job_id: 1775844820654_98397_17396)
+# Output: rema: job submitted (job_id: 1775844820654_98397_17396_20435_abCDef1234)
 
 # Do other work...
 
@@ -96,34 +102,39 @@ rema run gpu-server --async -- python train.py --epochs 100
 rema log gpu-server
 
 # Or check a specific job by ID
-rema log gpu-server 1775844820654_98397_17396
+rema log gpu-server 1775844820654_98397_17396_20435_abCDef1234
 
 # Inspect running jobs, all records, or terminate one specific running job
 rema jobs gpu-server
 rema jobs gpu-server -a
-rema kill gpu-server <job_id>
+# Replace this sample ID with the one printed by `rema run --async` or `rema jobs`.
+rema kill gpu-server 1775844820654_98397_17396_20435_abCDef1234
 ```
 
-**Step 5: Manage machines**
+**Step 5: Manage machines** From `dev-machine`, inspect workers or restart an
+online worker in its original working directory:
+
 ```bash
-# List all machines
 rema list
 # Output:
 #   NAME                 STATUS     RUNNING  HEARTBEAT
 #   gpu-server           idle       0        3s ago
 
-# Stop accepting submissions and wait for running jobs to finish (on gpu-server)
-rema stop gpu-server
-
-# Or terminate all of this worker's running jobs and stop
-rema stop gpu-server -f
-
-# Restart the remote ReMA worker from any client, keeping its working directory
 rema restart gpu-server
-# Or terminate its tracked jobs before restarting
-rema restart gpu-server -f
+```
 
-# Remove the machine entirely
+Add `-f` to `restart` only when you want to terminate that worker's tracked jobs
+before restarting. To stop the worker, run this command **on `gpu-server`**. It
+waits for running jobs to finish.
+
+```bash
+rema stop gpu-server
+```
+
+Add `-f` to `stop` if you want to terminate the worker's jobs instead.
+After the worker is off, remove its shared records from either machine:
+
+```bash
 rema rm gpu-server
 ```
 
@@ -165,6 +176,7 @@ It restarts ReMA, not the host OS, and requires a reachable, running worker.
 Working directory and history are preserved; existing commands never replay.
 See [restart details](docs/commands.md#restart-and-removal) for configuration and
 legacy-client behavior. The remote host's installed CLI is not rewritten.
+For a step-by-step upgrade, see the [v1.0.0 release notes](docs/releases/v1.0.0.md#upgrading-steps).
 
 Develop in the branch and directory requested by the user, with separate worker
 names and state directories for tests. Running workers need restart to load

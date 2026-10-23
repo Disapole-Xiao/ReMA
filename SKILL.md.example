@@ -39,6 +39,8 @@ Local checkout: `/path/to/ReMA` (replace with your repository location).
 ```bash
 git clone https://github.com/Disapole-Xiao/ReMA.git
 cd ReMA
+git fetch origin --tags
+git checkout v1.0.0
 bash install.sh
 # When prompted, set REMA_DIR to a directory on your shared mount.
 source ~/.bashrc
@@ -52,31 +54,32 @@ Before running commands, the remote machine must have a worker running:
 ```bash
 # On remote machine, in the desired working directory:
 cd /your/project
-rema start <name>
+rema start gpu-server
 ```
 
 Then from any machine:
 ```bash
 # Check status
-rema status <name>
+rema status gpu-server
 
 # Run command (sync, real-time output, same exit code as command)
-rema run <name> -- nvidia-smi
-rema run <name> -- "cd project && python train.py"
+rema run gpu-server -- nvidia-smi
+rema run gpu-server -- "cd project && python train.py"
 
 # Run command (async, returns immediately, retrieve with log)
-rema run <name> --async -- "sleep 10 && python train.py"
+rema run gpu-server --async -- "sleep 10 && python train.py"
 
 # Check output of async job (latest or by ID)
-rema log <name>
-rema log <name> <job_id>
+rema log gpu-server
+rema log gpu-server 1775844820654_98397_17396_20435_abCDef1234
 
 # List all machines
 rema list
 
-# Remove a machine (must be off — stop first if idle/busy)
-rema stop <name>
-rema rm <name>
+# On gpu-server, stop the worker and wait for its jobs to finish
+rema stop gpu-server
+# From any client, remove the off worker's shared records
+rema rm gpu-server
 ```
 
 ## Configuration
