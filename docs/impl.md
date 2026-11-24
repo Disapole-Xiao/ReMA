@@ -35,7 +35,7 @@ $REMA_DIR/<name>/
     command.sh           # full command, including embedded newlines
     session              # session captured by the submitting client
     state                # queued
-  jobs/<job_id>/          # claimed requests and retained job history
+  jobs/<job_id>/          # claimed requests and job history until retention expires
     command.sh
     session
     state                # running / finished / cancelled / expired / unknown
@@ -67,6 +67,8 @@ requests, and publishes the aggregate running count and status. Each iteration
 sleeps for `REMA_POLL_INTERVAL` (five seconds by default). Only the dispatcher writes
 aggregate status: one job finishing cannot make the worker idle while others run.
 Client output/control polling uses `REMA_OUTPUT_POLL_INTERVAL` (one second).
+Clients retry unreadable heartbeat and status records twice, half a second apart,
+before reporting `off`. The default heartbeat age limit is 180 seconds.
 
 The count covers commands whose Bash process has not yet been reaped. Commands
 must wait for work they intend ReMA to track. Backgrounding and detaching processes
@@ -87,9 +89,16 @@ monotonic even if graceful and force-stop clients overlap. Worker signal/exit
 cleanup also terminates its tracked jobs; SIGKILL cannot run cleanup handlers.
 
 Terminal metadata and shared status use temporary files plus atomic rename.
-The job's `exit_code` is published before its terminal `state`. Running and unknown
-logs are excluded from automatic cleanup; terminal log pruning runs in the worker
-loop at startup and hourly, independently of job submission volume.
+The job's `exit_code` is published before its terminal `state`. The terminal
+state file's modification time starts a seven-day retention window, including
+`unknown`. When it expires, the job directory and output log are both removed.
+Running and queued jobs are not pruned. A separate cleanup process scans at worker
+startup and no later than the next expiration or one hour, whichever comes first,
+so shared-storage scans do not delay the dispatcher's heartbeat. `jobs` and `log`
+also prune before listing. Orphaned logs from older installations use their own
+last modification time. Abandoned submission staging and legacy command files
+also expire after seven days. Completed restart diagnostics use their final state
+time; an active restart request is never pruned.
 
 ## Session boundaries and failures
 
@@ -119,6 +128,6 @@ Concurrent restart callers join the same request; `-f` is a monotonic escalation
 Legacy workers support graceful migration only; the helper pauses an idle
 dispatcher to verify no job is active before signalling that exact PID. Old
 clients must stop submitting during migration because they do not honor the lock.
-Restart snapshots and request diagnostics are retained. A helper crash can leave
+Restart snapshots and request diagnostics are retained for seven days. A helper crash can leave
 a lock: verify no helper or startup remains active before removing that exact
 lock. Offline workers require host access; a shared-file request cannot revive them.

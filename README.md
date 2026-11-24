@@ -30,7 +30,7 @@ It works like a simplified SSH replacement for environments where:
 git clone https://github.com/Disapole-Xiao/ReMA.git
 cd ReMA
 git fetch origin --tags
-git checkout v1.0.0
+git checkout v1.1.0
 
 # 2. Run installer
 bash install.sh
@@ -104,9 +104,13 @@ rema log gpu-server
 # Or check a specific job by ID
 rema log gpu-server 1775844820654_98397_17396_20435_abCDef1234
 
-# Inspect running jobs, all records, or terminate one specific running job
+# Inspect running jobs on every worker, all records, or one worker
+rema jobs
+rema jobs -a
 rema jobs gpu-server
 rema jobs gpu-server -a
+# Quote a glob so ReMA matches worker names, not files in this directory.
+rema jobs 'gpu-*'
 # Replace this sample ID with the one printed by `rema run --async` or `rema jobs`.
 rema kill gpu-server 1775844820654_98397_17396_20435_abCDef1234
 ```
@@ -132,17 +136,23 @@ rema stop gpu-server
 ```
 
 Add `-f` to `stop` if you want to terminate the worker's jobs instead.
-After the worker is off, remove its shared records from either machine:
+After a worker has been `off` for one full day, remove its shared records from
+either machine. With no names, `rm` removes every eligible worker; names and
+quoted globs can be combined. A selection containing an ineligible worker is
+rejected before any deletion.
 
 ```bash
 rema rm gpu-server
+rema rm
+rema rm gpu-1 'old-*'
 ```
 
 You can install and start ReMA on as many machines as you want. You can also run multiple workers on the same machine under different names (e.g., `rema start gpu-1` and `rema start gpu-2` on the same host).
 
 Each start creates a new session. Only commands submitted to that session are
 executed. Old queued commands expire, old incomplete execution records become
-`unknown`, and completed jobs are never replayed. Historical logs remain available.
+`unknown`, and completed jobs are never replayed. Terminal job history is retained
+for seven days after the terminal state is recorded.
 `kill` always requires a job ID; there is no machine-only shorthand.
 
 
@@ -156,16 +166,22 @@ See [docs/commands.md](docs/commands.md) for the full command reference with exa
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REMA_DIR` | *(required)* | Shared directory path (e.g., `/path/.rema`). Set automatically by `install.sh`. |
-| `REMA_LOG_KEEP_DAYS` | `7` | Auto-delete job logs older than N days |
+| `REMA_LOG_KEEP_DAYS` | `7` | Retain terminal job records, logs, and restart diagnostics for N days |
+| `REMA_RM_OFF_DAYS` | `1` | Minimum full days a worker must be `off` before `rema rm` can remove it |
 | `REMA_LOCAL_DIR` | `/tmp/rema` | Local worker PID and diagnostic log directory |
 | `REMA_POLL_INTERVAL` | `5` | Worker loop sleep in seconds; heartbeat updates in the same loop |
 | `REMA_OUTPUT_POLL_INTERVAL` | `1` | Client output/control polling interval in seconds |
+| `REMA_STATUS_TIMEOUT` | `180` | Maximum heartbeat age before reporting `off`; transient read failures are retried twice |
 
 ReMA reads settings from `~/.rema_config`. You can also override them via environment variables. Priority: **environment variable** > `~/.rema_config` > default value.
 
-Log retention applies only to finished, cancelled, or expired jobs. Running and
-unknown job logs are preserved. `rema log <name>` selects the most recently
-submitted job, not whichever running job last wrote output.
+Retention starts when a job becomes `finished`, `cancelled`, `expired`, or
+`unknown`. After seven full 24-hour days, ReMA deletes its command, state, exit
+code, and output together. Running and queued jobs are kept until they reach a
+terminal state. Completed restart diagnostics follow the same limit. The worker
+cleans in the background, and `jobs` / `log` clean expired entries before reading.
+`rema log <name>` selects the most recently submitted retained job, not whichever
+running job last wrote output.
 
 ## Development and upgrades
 
@@ -176,7 +192,7 @@ It restarts ReMA, not the host OS, and requires a reachable, running worker.
 Working directory and history are preserved; existing commands never replay.
 See [restart details](docs/commands.md#restart-and-removal) for configuration and
 legacy-client behavior. The remote host's installed CLI is not rewritten.
-For a step-by-step upgrade, see the [v1.0.0 release notes](docs/releases/v1.0.0.md#upgrading-steps).
+For a step-by-step upgrade, see the [v1.1.0 release notes](docs/releases/v1.1.0.md#upgrading-steps).
 
 Develop in the branch and directory requested by the user, with separate worker
 names and state directories for tests. Running workers need restart to load

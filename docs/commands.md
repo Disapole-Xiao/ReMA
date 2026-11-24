@@ -9,12 +9,12 @@
 | `rema status <name>` | Print `idle`, `busy`, or `off` |
 | `rema run <name> -- <command>` | Submit, follow that job's output, and return its exit code |
 | `rema run <name> --async -- <command>` | Submit and return its job ID immediately |
-| `rema jobs <name>` | List only jobs in the `running` state |
-| `rema jobs <name> -a` | List all jobs, including queued jobs and retained history (`--all` also works) |
+| `rema jobs [name-or-glob ...]` | List running jobs on every worker, or on selected workers |
+| `rema jobs [name-or-glob ...] -a` | Include queued jobs and retained history (`--all` also works) |
 | `rema log <name> [job_id]` | Read the specified job's log, or the latest submitted job's log |
 | `rema kill <name> <job_id>` | Terminate one running job; the job ID is mandatory |
 | `rema list` | List workers, status, running counts, and heartbeat age |
-| `rema rm <name>` | Delete an off worker's shared records and logs |
+| `rema rm [name-or-glob ...]` | Remove all eligible off workers, or selected eligible workers |
 | `rema -h` / `rema --help` | Show help |
 | `rema -V` / `rema --version` | Show version |
 
@@ -57,9 +57,9 @@ also returns 125; it does not undo the submission.
 | `unknown` | Left incomplete by an earlier worker; outcome cannot be confirmed |
 
 `jobs` shows only `running` tasks. Use `rema jobs <name> -a` to include queued,
-finished, cancelled, expired, and unknown records. `log` without an ID selects the
-latest submission; a queued job may not have output yet. A retained record can
-outlive its log under the retention policy.
+finished, cancelled, expired, and unknown records from the last seven days after
+completion. `log` without an ID selects the latest retained submission; a queued
+job may not have output yet. Expired job metadata and output are removed together.
 
 ## Stop and kill
 
@@ -120,8 +120,20 @@ An uncatchable worker failure (SIGKILL or host failure) can leave command proces
 alive. `off` describes the worker's availability, not proof that all host processes
 have stopped. Restart does not automatically adopt or kill those old processes.
 
-`rm` requires `off` and removes shared machine metadata and job logs. There is no
-force-remove option for online workers.
+`rm` removes shared machine metadata and job logs only after a worker has remained
+`off` for `REMA_RM_OFF_DAYS` full days (one by default). A clean stop uses the
+recorded `off` time; a stale heartbeat uses the time it crossed
+`REMA_STATUS_TIMEOUT`. Start or restart locks prevent removal. With no arguments,
+`rm` skips workers that are online or too recently off. With explicit names or
+globs, every match must be eligible before any deletion starts.
+
+Both `jobs` and `rm` accept several names and shell-style globs. Quote globs so
+your shell passes them to ReMA: `rema jobs 'gpu-*' local`, or
+`rema rm 'old-*' retired`. A selector matching no registered machine is an
+error. Repeated matches are shown or removed once. `jobs` without selectors
+shows running tasks from every worker; add `-a` for their queued tasks and
+history. Output includes a `MACHINE` column when no names are supplied or more
+than one machine is selected. The single-name `jobs <name>` format is unchanged.
 
 ## Configuration
 
@@ -131,10 +143,11 @@ Environment variables override `~/.rema_config`, which overrides defaults.
 | --- | --- | --- |
 | `REMA_DIR` | required | Absolute shared state directory |
 | `REMA_LOCAL_DIR` | `/tmp/rema` | Absolute local PID/session/worker-log directory |
-| `REMA_LOG_KEEP_DAYS` | `7` | Retention for terminal job logs, excluding `unknown` |
+| `REMA_LOG_KEEP_DAYS` | `7` | Retention for terminal job records, logs, and completed restart diagnostics |
+| `REMA_RM_OFF_DAYS` | `1` | Minimum full days a worker must be off before removal; `0` permits immediate removal |
 | `REMA_POLL_INTERVAL` | `5` | Worker loop sleep in seconds; heartbeat updates in the same loop |
 | `REMA_OUTPUT_POLL_INTERVAL` | `1` | Client output/control polling interval in seconds |
-| `REMA_STATUS_TIMEOUT` | `60` | Maximum heartbeat age before reporting `off` |
+| `REMA_STATUS_TIMEOUT` | `180` | Maximum heartbeat age before reporting `off` |
 | `REMA_OUTPUT_LOG_WAIT` | `30` | Startup and initial job-output timeout in seconds |
 | `REMA_CONTROL_TIMEOUT` | `30` | Timeout waiting for a targeted cancellation |
 | `REMA_KILL_GRACE` | `5` | Seconds before escalating a termination to SIGKILL |
@@ -142,3 +155,6 @@ Environment variables override `~/.rema_config`, which overrides defaults.
 Heartbeats update synchronously on each worker-loop iteration. There is no
 separate heartbeat process or timer. Status and task counts reflect the latest
 poll; they are observations rather than submission locks.
+Clients retry an unreadable heartbeat or status record twice, half a second
+apart, before reporting `off`. A stale heartbeat still reports `off` after
+`REMA_STATUS_TIMEOUT`; increasing this timeout delays detection of a stopped worker.

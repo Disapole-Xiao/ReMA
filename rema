@@ -2,12 +2,12 @@
 # ReMA — Remote Machine Access through a shared filesystem.
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROTOCOL=2
 
 # Configuration files supply defaults; explicit environment values win.
 declare -A _rema_env=()
-CONFIG_KEYS=(REMA_DIR REMA_LOCAL_DIR REMA_LOG_KEEP_DAYS REMA_POLL_INTERVAL REMA_OUTPUT_POLL_INTERVAL \
+CONFIG_KEYS=(REMA_DIR REMA_LOCAL_DIR REMA_LOG_KEEP_DAYS REMA_RM_OFF_DAYS REMA_POLL_INTERVAL REMA_OUTPUT_POLL_INTERVAL \
   REMA_STATUS_TIMEOUT REMA_OUTPUT_LOG_WAIT REMA_CONTROL_TIMEOUT REMA_KILL_GRACE)
 for _rema_key in "${CONFIG_KEYS[@]}"; do
   if [[ -v $_rema_key ]]; then _rema_env[$_rema_key]="${!_rema_key}"; fi
@@ -21,13 +21,14 @@ unset _rema_key
 REMA_DIR="${REMA_DIR:-}"
 REMA_LOCAL_DIR="${REMA_LOCAL_DIR:-/tmp/rema}"
 REMA_LOG_KEEP_DAYS="${REMA_LOG_KEEP_DAYS:-7}"
+REMA_RM_OFF_DAYS="${REMA_RM_OFF_DAYS:-1}"
 REMA_POLL_INTERVAL="${REMA_POLL_INTERVAL:-5}"
 REMA_OUTPUT_POLL_INTERVAL="${REMA_OUTPUT_POLL_INTERVAL:-1}"
-REMA_STATUS_TIMEOUT="${REMA_STATUS_TIMEOUT:-60}"
+REMA_STATUS_TIMEOUT="${REMA_STATUS_TIMEOUT:-180}"
 REMA_OUTPUT_LOG_WAIT="${REMA_OUTPUT_LOG_WAIT:-30}"
 REMA_CONTROL_TIMEOUT="${REMA_CONTROL_TIMEOUT:-30}"
 REMA_KILL_GRACE="${REMA_KILL_GRACE:-5}"
-export REMA_DIR REMA_LOCAL_DIR REMA_LOG_KEEP_DAYS REMA_POLL_INTERVAL
+export REMA_DIR REMA_LOCAL_DIR REMA_LOG_KEEP_DAYS REMA_RM_OFF_DAYS REMA_POLL_INTERVAL
 export REMA_OUTPUT_POLL_INTERVAL
 export REMA_STATUS_TIMEOUT REMA_OUTPUT_LOG_WAIT REMA_CONTROL_TIMEOUT REMA_KILL_GRACE
 
@@ -53,7 +54,7 @@ check_dir() {
   [[ $REMA_DIR = /* ]] || die "REMA_DIR must be an absolute shared directory path"
   [[ $REMA_LOCAL_DIR = /* ]] || die "REMA_LOCAL_DIR must be an absolute local directory path"
   local key
-  for key in REMA_LOG_KEEP_DAYS REMA_STATUS_TIMEOUT REMA_OUTPUT_LOG_WAIT REMA_CONTROL_TIMEOUT REMA_KILL_GRACE; do
+  for key in REMA_LOG_KEEP_DAYS REMA_RM_OFF_DAYS REMA_STATUS_TIMEOUT REMA_OUTPUT_LOG_WAIT REMA_CONTROL_TIMEOUT REMA_KILL_GRACE; do
     [[ ${!key} =~ ^[0-9]+$ ]] || die "$key must be a nonnegative integer"
   done
   for key in REMA_POLL_INTERVAL REMA_OUTPUT_POLL_INTERVAL; do
@@ -71,25 +72,78 @@ write_value() {
   return 1
 }
 
+# Retry transient shared-storage read failures before treating a heartbeat as absent.
 heartbeat_age() {
-  local stamp
-  stamp=$(read_value "$1") || { echo 999999; return; }
-  [[ $stamp =~ ^[0-9]+$ ]] || { echo 999999; return; }
-  echo "$(( $(date +%s) - stamp ))"
+  local stamp attempt
+  for attempt in 1 2 3; do
+    stamp=$(read_value "$1") || stamp=""
+    if [[ $stamp =~ ^[0-9]+$ ]]; then
+      echo "$(( $(date +%s) - stamp ))"
+      return
+    fi
+    [ "$attempt" -eq 3 ] || sleep 0.5
+  done
+  echo 999999
 }
 
+# Retry an unreadable status record before reporting the worker as off.
 get_status() {
-  local sdir="$1" status
+  local sdir="$1" status attempt
   if [ "$(heartbeat_age "$sdir/heartbeat")" -gt "$REMA_STATUS_TIMEOUT" ]; then
     echo off; return
   fi
-  status=$(read_value "$sdir/status") || status=off
-  case "$status" in idle|busy) echo "$status" ;; *) echo off ;; esac
+  for attempt in 1 2 3; do
+    status=$(read_value "$sdir/status") || status=""
+    case "$status" in idle|busy|off) echo "$status"; return ;; esac
+    [ "$attempt" -eq 3 ] || sleep 0.5
+  done
+  echo off
 }
 
 check_machine() {
   check_name "$1"; check_dir
   [ -d "$(machine_dir "$1")" ] || die "machine '$1' not found"
+}
+
+# Expand quoted shell-style selectors against registered worker names only.
+select_machines() {
+  local -n _matches="$1"
+  shift
+  local selector sdir name found implicit=false
+  local -a registered=()
+  local -A seen=()
+  if [ "$#" -eq 0 ]; then set -- '*'; implicit=true; fi
+  for sdir in "$REMA_DIR/"*/; do
+    [ -f "$sdir/status" ] || continue
+    name="${sdir%/}"; registered+=("${name##*/}")
+  done
+  for selector in "$@"; do
+    found=false
+    for name in "${registered[@]}"; do
+      if [[ $name == $selector ]]; then
+        found=true
+        if [ -z "${seen[$name]+present}" ]; then
+          _matches+=("$name")
+          seen[$name]=1
+        fi
+      fi
+    done
+    if ! $found && ! $implicit; then die "no machines match: $selector"; fi
+  done
+}
+
+# Use the recorded off transition, or heartbeat expiry after an unclean stop.
+off_since() {
+  local sdir="$1" status stamp
+  [ "$(get_status "$sdir")" = off ] || return 1
+  status=$(read_value "$sdir/status") || return 1
+  if [ "$status" = off ]; then
+    stat -c %Y -- "$sdir/status" || return 1
+  else
+    stamp=$(read_value "$sdir/heartbeat") || return 1
+    [[ $stamp =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$((stamp + REMA_STATUS_TIMEOUT))"
+  fi
 }
 
 check_protocol() {
@@ -108,17 +162,97 @@ job_dir() {
   else return 1; fi
 }
 
-clean_old_logs() {
-  local sdir="$1" dir state id
-  for dir in "$sdir/jobs/"*/; do
-    [ -d "$dir" ] || continue
-    state=$(read_value "$dir/state") || continue
-    # Unknown jobs may still have an orphan writing output; never prune those.
-    case "$state" in finished|cancelled|expired)
-      id="${dir%/}"; id="${id##*/}"
-      find "$sdir/output/$id.log" -type f -mtime "+$REMA_LOG_KEEP_DAYS" -delete 2>/dev/null || true ;;
-    esac
+# Remove complete ReMA-managed history at seven days from terminalization.
+clean_old_records() {
+  local sdir="$1" now="$2" keep_seconds=$((REMA_LOG_KEEP_DAYS * 86400))
+  local next=$((now + 3600)) path dir state stamp due id active_request=""
+  if [ -d "$sdir/restart.lock" ]; then
+    active_request=$(read_value "$sdir/restart.lock/request") || active_request=""
+  fi
+
+  # A terminal state is the retention clock; active and queued jobs have no expiry.
+  for path in "$sdir/jobs/"*/; do
+    [ -d "$path" ] || continue
+    dir="${path%/}"
+    state=$(read_value "$dir/state") || { [ ! -d "$dir" ] && continue; return 1; }
+    is_terminal "$state" || continue
+    stamp=$(stat -c %Y -- "$dir/state") || { [ ! -d "$dir" ] && continue; return 1; }
+    due=$((stamp + keep_seconds))
+    if [ "$now" -ge "$due" ]; then
+      id="${dir##*/}"
+      rm -f -- "$sdir/output/$id.log" && rm -rf -- "$dir" || return 1
+    elif [ "$due" -lt "$next" ]; then next=$due; fi
   done
+
+  # Older installations can leave logs without a job directory.
+  for path in "$sdir/output/"*.log; do
+    [ -f "$path" ] || continue
+    id="${path##*/}"; id="${id%.log}"
+    [ ! -d "$sdir/jobs/$id" ] && [ ! -d "$sdir/pending/$id" ] || continue
+    stamp=$(stat -c %Y -- "$path") || { [ ! -e "$path" ] && continue; return 1; }
+    due=$((stamp + keep_seconds))
+    if [ "$now" -ge "$due" ]; then
+      rm -f -- "$path" || return 1
+    elif [ "$due" -lt "$next" ]; then next=$due; fi
+  done
+
+  # Restart diagnostics can contain a bootstrap job ID, command, and output.
+  for path in "$sdir/restarts/"*/; do
+    [ -d "$path" ] || continue
+    dir="${path%/}"
+    id="${dir##*/}"
+    if [ -d "$sdir/restart.lock" ] && { [ -z "$active_request" ] || [ "$id" = "$active_request" ]; }; then continue; fi
+    if [ -f "$dir/state" ]; then
+      stamp=$(stat -c %Y -- "$dir/state") || { [ ! -d "$dir" ] && continue; return 1; }
+    else
+      stamp=$(stat -c %Y -- "$dir") || { [ ! -d "$dir" ] && continue; return 1; }
+    fi
+    due=$((stamp + keep_seconds))
+    if [ "$now" -ge "$due" ]; then
+      rm -rf -- "$dir" || return 1
+    elif [ "$due" -lt "$next" ]; then next=$due; fi
+  done
+
+  # Unpublished client staging and legacy single-slot files can retain commands.
+  for path in "$sdir/".submit.*/; do
+    [ -d "$path" ] || continue
+    dir="${path%/}"
+    stamp=$(stat -c %Y -- "$dir") || { [ ! -d "$dir" ] && continue; return 1; }
+    due=$((stamp + keep_seconds))
+    if [ "$now" -ge "$due" ]; then
+      rm -rf -- "$dir" || return 1
+    elif [ "$due" -lt "$next" ]; then next=$due; fi
+  done
+  if [ "$(read_value "$sdir/protocol")" = "$PROTOCOL" ]; then
+    for path in "$sdir/cmd" "$sdir/job" "$sdir/job.kill"; do
+      [ -f "$path" ] || continue
+      stamp=$(stat -c %Y -- "$path") || { [ ! -e "$path" ] && continue; return 1; }
+      due=$((stamp + keep_seconds))
+      if [ "$now" -ge "$due" ]; then
+        rm -f -- "$path" || return 1
+      elif [ "$due" -lt "$next" ]; then next=$due; fi
+    done
+  fi
+  printf '%s\n' "$next"
+}
+
+# An explicit log lookup must not scan every job on a large shared mount.
+clean_selected_log() {
+  local sdir="$1" id="$2" now="$3" keep_seconds=$((REMA_LOG_KEEP_DAYS * 86400))
+  local dir="$sdir/jobs/$id" log="$sdir/output/$id.log" state stamp
+  if [ -d "$dir" ]; then
+    state=$(read_value "$dir/state") || return 1
+    is_terminal "$state" || return 0
+    stamp=$(stat -c %Y -- "$dir/state") || return 1
+    if [ "$now" -ge "$((stamp + keep_seconds))" ]; then
+      rm -f -- "$log" && rm -rf -- "$dir" || return 1
+    fi
+  elif [ -f "$log" ] && [ ! -d "$sdir/pending/$id" ]; then
+    stamp=$(stat -c %Y -- "$log") || return 1
+    if [ "$now" -ge "$((stamp + keep_seconds))" ]; then
+      rm -f -- "$log" || return 1
+    fi
+  fi
 }
 
 # Worker helpers use the owning loop's local variables (Bash dynamic scope).
@@ -173,7 +307,7 @@ _worker_loop() {
   sdir=$(machine_dir "$name"); ldir=$(local_dir "$name")
   local -A job_pids=() job_pgids=() cancel_at=()
   local stopping=false force_stop=false previous_count=-1 next_clean=0
-  local path id state now code count
+  local path id state now code count cleanup_pid="" cleanup_result="$ldir/cleanup-$session.next"
   set +m  # setsid's child PID is also its new process-group ID.
   trap worker_cleanup EXIT
   trap 'exit 143' TERM
@@ -268,7 +402,24 @@ _worker_loop() {
     fi
     # Exit here so the EXIT trap still has access to this function's locals.
     if $stopping && [ "$count" -eq 0 ]; then exit 0; fi
-    if [ "$now" -ge "$next_clean" ]; then clean_old_logs "$sdir"; next_clean=$((now + 3600)); fi
+    # Shared storage scans can be slow; keep the dispatcher's heartbeat responsive.
+    if [ -n "$cleanup_pid" ] && ! kill -0 "$cleanup_pid" 2>/dev/null; then
+      if wait "$cleanup_pid" && [ -f "$cleanup_result" ]; then
+        next_clean=$(read_value "$cleanup_result") || next_clean=$((now + 60))
+      else
+        printf 'history cleanup failed; retrying in 60 seconds\n' >&2
+        next_clean=$((now + 60))
+      fi
+      rm -f -- "$cleanup_result"
+      cleanup_pid=""
+    fi
+    if [ -z "$cleanup_pid" ] && [ "$now" -ge "$next_clean" ]; then
+      rm -f -- "$cleanup_result"
+      # Remote restart snapshots expire; use the loaded worker code, not $0.
+      ( trap - EXIT TERM INT HUP; clean_old_records "$sdir" "$now" ) > "$cleanup_result" &
+      cleanup_pid=$!
+      next_clean=$((now + 3600))
+    fi
     sleep "$REMA_POLL_INTERVAL"
   done
 }
@@ -411,28 +562,42 @@ cmd_run() {
   follow_job "$sdir" "$id" "$session"
 }
 
+# Show current jobs from every registered worker or the selected names.
 cmd_jobs() {
-  local name="" all=false sdir path id state code command
+  local all=false show_machine=false name sdir path id state code command
+  local -a selectors=() names=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -a|--all) all=true ;;
       -*) die "unknown option: $1" ;;
-      *) [ -z "$name" ] || die "usage: rema jobs <name> [-a]"; name="$1" ;;
+      *) selectors+=("$1") ;;
     esac
     shift
   done
-  [ -n "$name" ] || die "usage: rema jobs <name> [-a]"
-  check_machine "$name"
-  sdir=$(machine_dir "$name")
-  printf '%-65s %-12s %-5s %s\n' JOB_ID STATE EXIT COMMAND
-  for path in "$sdir/jobs/"* "$sdir/pending/"*; do
-    [ -d "$path" ] || continue
-    id="${path##*/}"
-    state=$(read_value "$path/state") || state=unknown
-    $all || [ "$state" = running ] || continue
-    code=$(read_value "$path/exit_code") || code=-
-    command=$(tr '\n' ' ' < "$path/command.sh" 2>/dev/null) || command=""
-    printf '%-65s %-12s %-5s %s\n' "$id" "$state" "$code" "$command"
+  check_dir
+  select_machines names "${selectors[@]}"
+  if [ "${#names[@]}" -eq 0 ]; then echo "no machines found"; return 0; fi
+  if [ "${#selectors[@]}" -eq 0 ] || [ "${#names[@]}" -gt 1 ]; then show_machine=true; fi
+  if $all; then
+    for name in "${names[@]}"; do
+      sdir=$(machine_dir "$name")
+      clean_old_records "$sdir" "$(date +%s)" >/dev/null || die "cannot clean expired job history for '$name'"
+    done
+  fi
+  if $show_machine; then printf '%-20s %-65s %-12s %-5s %s\n' MACHINE JOB_ID STATE EXIT COMMAND
+  else printf '%-65s %-12s %-5s %s\n' JOB_ID STATE EXIT COMMAND; fi
+  for name in "${names[@]}"; do
+    sdir=$(machine_dir "$name")
+    for path in "$sdir/jobs/"* "$sdir/pending/"*; do
+      [ -d "$path" ] || continue
+      id="${path##*/}"
+      state=$(read_value "$path/state") || state=unknown
+      $all || [ "$state" = running ] || continue
+      code=$(read_value "$path/exit_code") || code=-
+      command=$(tr '\n' ' ' < "$path/command.sh" 2>/dev/null) || command=""
+      if $show_machine; then printf '%-20s %-65s %-12s %-5s %s\n' "$name" "$id" "$state" "$code" "$command"
+      else printf '%-65s %-12s %-5s %s\n' "$id" "$state" "$code" "$command"; fi
+    done
   done
 }
 
@@ -442,6 +607,7 @@ cmd_log() {
   local sdir id="${2:-}" path candidate latest=""
   sdir=$(machine_dir "$1")
   if [ -z "$id" ]; then
+    clean_old_records "$sdir" "$(date +%s)" >/dev/null || die "cannot clean expired job history"
     # Submission IDs sort chronologically; a long-running old log is not 'latest'.
     for path in "$sdir/jobs/"* "$sdir/pending/"* "$sdir/output/"*.log; do
       [ -e "$path" ] || continue
@@ -452,6 +618,7 @@ cmd_log() {
     [ -n "$id" ] || die "no jobs found for '$1'"
   fi
   check_name "$id"
+  clean_selected_log "$sdir" "$id" "$(date +%s)" || die "cannot clean expired job history"
   if [ -f "$sdir/output/$id.log" ]; then cat -- "$sdir/output/$id.log"
   elif [ -d "$sdir/pending/$id" ]; then echo "rema: job queued; no output yet (job_id: $id)"
   else die "log not found: $id"; fi
@@ -725,7 +892,9 @@ cmd_restart() {
     if $force; then write_value "$request/force" yes || die "cannot request force restart"; fi
     id=$(gen_id)
     write_value "$request/job_id" "$id" || die "cannot save bootstrap job ID"
-    printf -v command 'bash %q _restart_handoff %q %q' "$request/script" "$name" "$request_id"
+    # The old worker exports its old default; use the client's timeout during handoff.
+    printf -v command 'REMA_STATUS_TIMEOUT=%q bash %q _restart_handoff %q %q' \
+      "$REMA_STATUS_TIMEOUT" "$request/script" "$name" "$request_id"
     if [ "$protocol" = 2 ]; then
       staging=$(mktemp -d "$sdir/.submit.XXXXXXXXXX") || die "cannot stage restart job"
       printf '%s\n' "$command" > "$staging/command.sh"
@@ -814,15 +983,47 @@ cmd_list() {
   if $first; then echo "no machines found"; fi
 }
 
+# A machine is removable only after it has stayed off for the configured interval.
+machine_removable() {
+  local sdir="$1" now="$2" since
+  [ ! -d "$sdir/start.lock" ] && [ ! -d "$sdir/restart.lock" ] || return 1
+  # A fresh heartbeat contradicts a stale `off` status file; never bulk-remove it.
+  if [ "$REMA_RM_OFF_DAYS" -gt 0 ]; then
+    [ "$(heartbeat_age "$sdir/heartbeat")" -gt "$REMA_STATUS_TIMEOUT" ] || return 1
+  fi
+  since=$(off_since "$sdir") || return 1
+  [ "$((now - since))" -ge "$((REMA_RM_OFF_DAYS * 86400))" ]
+}
+
+# Remove only workers that pass the off-age safety check; explicit sets preflight.
 cmd_rm() {
-  [ "$#" -eq 1 ] || die "usage: rema rm <name>"
-  check_machine "$1"
-  local sdir
-  sdir=$(machine_dir "$1")
-  [ ! -d "$sdir/restart.lock" ] || die "worker '$1' has a restart in progress"
-  [ "$(get_status "$sdir")" = off ] || die "worker '$1' is online; run 'rema stop $1' first"
-  rm -rf -- "$sdir"
-  echo "rema: machine '$1' removed"
+  local explicit=false name sdir now
+  local -a names=() selected=()
+  for name in "$@"; do
+    case "$name" in -*) die "unknown option: $name" ;; esac
+  done
+  if [ "$#" -gt 0 ]; then explicit=true; fi
+  check_dir
+  select_machines names "$@"
+  now=$(date +%s)
+  # Validate the whole explicit selection before deleting any machine.
+  for name in "${names[@]}"; do
+    sdir=$(machine_dir "$name")
+    if machine_removable "$sdir" "$now"; then selected+=("$name")
+    elif $explicit; then
+      die "worker '$name' must be off for at least $REMA_RM_OFF_DAYS day(s), with no start or restart in progress"
+    fi
+  done
+  if [ "${#selected[@]}" -eq 0 ]; then
+    echo "rema: no workers have been off for $REMA_RM_OFF_DAYS day(s)"
+    return 0
+  fi
+  for name in "${selected[@]}"; do
+    sdir=$(machine_dir "$name")
+    machine_removable "$sdir" "$(date +%s)" || die "worker '$name' changed state before removal"
+    rm -rf -- "$sdir" || die "cannot remove worker '$name'"
+    echo "rema: machine '$name' removed"
+  done
 }
 
 usage() {
@@ -835,11 +1036,11 @@ Usage:
   rema restart <name> [-f]              Restart remote worker; keep working directory
   rema status <name>                    Show idle / busy / off
   rema run <name> [--async] -- <command> Submit a job, including while busy
-  rema jobs <name> [-a]                 List running jobs; -a shows all jobs
+  rema jobs [name-or-glob ...] [-a]    List running jobs across selected workers
   rema log <name> [job_id]               Show job output (latest if ID omitted)
   rema kill <name> <job_id>              Terminate one job; ID is required
   rema list                             List workers and running job counts
-  rema rm <name>                        Remove an off worker and its history
+  rema rm [name-or-glob ...]           Remove workers off for at least 1 day
   rema -h, --help                       Show help
   rema -V, --version                    Show version
 EOF
@@ -855,6 +1056,7 @@ main() {
     kill) cmd_kill "$@" ;; list) cmd_list "$@" ;; rm) cmd_rm "$@" ;;
     -h|--help) usage ;; -V|--version) echo "rema $VERSION" ;;
     _worker) _worker_loop "$@" ;;
+    _cleanup) check_machine "$1"; clean_old_records "$(machine_dir "$1")" "$2" ;;
     _restart_handoff) _restart_handoff "$@" ;; _restart_finish) _restart_finish "$@" ;;
     *) die "unknown command: $command (see 'rema --help')" ;;
   esac

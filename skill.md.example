@@ -21,13 +21,13 @@ Local checkout: `/path/to/ReMA` (replace with your repository location).
 | `rema status <name>` | idle / busy / off |
 | `rema run <name> -- <cmd>` | Sync: real-time output, wait for completion |
 | `rema run <name> --async -- <cmd>` | Async: submit and return immediately |
-| `rema jobs <name>` | List only running jobs |
-| `rema jobs <name> -a` | List all jobs, including queued tasks and history (`--all` also works) |
+| `rema jobs [name-or-glob ...]` | List running jobs on all or selected workers |
+| `rema jobs [name-or-glob ...] -a` | Include queued tasks and history (`--all` also works) |
 | `rema kill <name> <job_id>` | Terminate a running job; job ID is mandatory |
 | `rema log <name>` | Show latest job output |
 | `rema log <name> <job_id>` | Show specific job output |
 | `rema list` | Show all machines and status |
-| `rema rm <name>` | Remove a machine (must be off) |
+| `rema rm [name-or-glob ...]` | Remove all or selected workers off for the configured interval |
 
 ## Usage
 
@@ -59,7 +59,9 @@ rema log gpu-server
 - Sync mode returns the same exit code as the command
 - `rema list` shows all registered machines; `off` means worker is not running or heartbeat expired
 - Each job gets a unique ID; use `rema log <name> <job_id>` for specific jobs
-- To remove a machine, it must be `off` — run `rema stop` first if idle/busy
+- To remove a machine, it must be `off` for at least `REMA_RM_OFF_DAYS` — run `rema stop` first if idle/busy
+- `rm` without names removes all eligible workers; explicit names and quoted globs are checked together before deletion
+- `jobs` without names shows running jobs on all workers; several names or quoted globs are accepted, and `-a` includes history
 - `busy` is informational: new sync and async jobs can execute concurrently
 - `kill` requires a job ID; it targets only that job's process group
 - `stop` drains running jobs; `stop -f` terminates all jobs owned by this worker
@@ -85,7 +87,9 @@ Set via `~/.rema_config` or environment variable:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REMA_DIR` | required | Shared directory path |
-| `REMA_LOG_KEEP_DAYS` | `7` | Auto-delete old logs |
+| `REMA_LOG_KEEP_DAYS` | `7` | Retain completed job history and output for N days |
+| `REMA_RM_OFF_DAYS` | `1` | Minimum full days off before removing a worker |
 | `REMA_LOCAL_DIR` | `/tmp/rema` | Local worker state directory |
 | `REMA_POLL_INTERVAL` | `5` | Worker loop sleep in seconds; heartbeat updates in the same loop |
 | `REMA_OUTPUT_POLL_INTERVAL` | `1` | Client output/control polling interval in seconds |
+| `REMA_STATUS_TIMEOUT` | `180` | Maximum heartbeat age before reporting `off`; transient read failures are retried twice |
